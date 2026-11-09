@@ -12,6 +12,7 @@ AI Local Video Editor Studio Pro is a desktop application for assembling source 
 - Choose clip timing based on the reference video, music beats, or a hybrid of both.
 - Optionally rank clips by scoring a frame from each video with an Ollama vision model.
 - Sample video segments across the full duration of source videos, optionally rank sampled scenes with Ollama, and use their source timestamps instead of always taking the beginning.
+- Speed up sample evaluation by reusing in-memory JPEG frames, a persistent local Ollama connection, cached preference data, and keeping the vision model loaded during scoring; show rolling remaining-time and estimated-finish updates without changing frame coverage or image quality settings.
 - Review the rendered video in-app, with playback pausing at every scene boundary for a 1–5 star rating and optional feedback.
 - Create a Windows-compatible WMV preview with the rendered audio, plus Skip-to-completion and Replay controls.
 - Store compact scene ratings and perceptual hashes in `Memory Learning/memory_learning.db`; use prior ratings to personalize later clip scoring.
@@ -114,6 +115,7 @@ AI Local Video Editor Studio Pro adalah aplikasi desktop untuk menyusun klip vid
 - Memasukkan **External Promt** opsional untuk tiap edit dari panel pengaturan; Ollama menggabungkannya dengan rating, komentar, dan prompt edit sebelumnya saat memilih adegan.
 - Menyimpan hasil render ke lokasi pilihan atau membuat ulang edit dengan rating tersimpan dan prompt global opsional.
 - Memindai semua video bahan atau membatasi pemindaian AI pada 30 video pertama.
+- Mempercepat evaluasi sampel dengan memakai ulang frame JPEG di memori, koneksi Ollama lokal, data preferensi yang di-cache, dan menjaga model tetap dimuat selama penilaian; menampilkan pembaruan sisa waktu dan perkiraan selesai tanpa mengubah cakupan sampel atau pengaturan kualitas gambar.
 - Memilih ukuran output 9:16, 16:9, 1:1, atau 4:5.
 - Mengatur durasi 15, 30, atau 60 detik, atau mengikuti durasi penuh soundtrack.
 - Mempertahankan atau mematikan audio video bahan, mencampurnya dengan soundtrack opsional, serta mengaktifkan filter `deshake` FFmpeg secara opsional.

@@ -15,7 +15,7 @@ import requests
 import numpy as np
 import cv2
 import librosa
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ==============================================================================
 # AUTOMATIC ENVIRONMENT SETUP & PATH INJECTION
@@ -46,6 +46,13 @@ from scenedetect import detect, ContentDetector
 
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
 DEFAULT_VISION_MODEL = "qwen2.5vl:3b"
+
+
+def format_elapsed_time(seconds):
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 def check_render_quality(
@@ -505,6 +512,8 @@ def build_temporal_sample_starts(
 class OllamaAIAnalyst:
     """Mengirim sampel frame video ke Ollama Qwen2.5-VL 3B untuk analisis estetika & sinematografi."""
 
+    _session = requests.Session()
+
     @staticmethod
     def get_installed_models():
         """Mengecek daftar model terinstal di server Ollama lokal."""
@@ -530,10 +539,13 @@ class OllamaAIAnalyst:
     @staticmethod
     def score_video_clip_with_memory(
         model_name, image_path, memory_engine, prompt_criteria="sinematik, pencahayaan bagus, aksi tajam",
-        prompt_override=""
+        prompt_override="", image_bytes=None, examples=None, memory_profile=None
     ):
-        examples = memory_engine.get_few_shot_examples(limit=5)
-        memory_context = memory_engine.get_preference_profile()
+        if examples is None:
+            examples = memory_engine.get_few_shot_examples(limit=5)
+        if memory_profile is None:
+            memory_profile = memory_engine.get_preference_profile()
+        memory_context = memory_profile
         if examples:
             example_lines = []
             for example in examples:
@@ -569,14 +581,18 @@ class OllamaAIAnalyst:
                 + prompt_override.strip()
             )
         return OllamaAIAnalyst._score_video_clip(
-            model_name, image_path, prompt_criteria, memory_context
+            model_name, image_path, prompt_criteria, memory_context, image_bytes
         )
 
     @staticmethod
-    def _score_video_clip(model_name, image_path, prompt_criteria, system_context):
+    def _score_video_clip(
+        model_name, image_path, prompt_criteria, system_context, image_bytes=None
+    ):
         try:
-            with open(image_path, "rb") as f:
-                img_b64 = base64.b64encode(f.read()).decode('utf-8')
+            if image_bytes is None:
+                with open(image_path, "rb") as f:
+                    image_bytes = f.read()
+            img_b64 = base64.b64encode(image_bytes).decode('utf-8')
 
             prompt = (
                 f"Analisis foto ini berdasarkan kriteria: {prompt_criteria}.\n"
@@ -590,13 +606,16 @@ class OllamaAIAnalyst:
                 "prompt": prompt,
                 "images": [img_b64],
                 "stream": False,
+                "keep_alive": "10m",
                 "options": {
                     "temperature": 0.2,
                     "num_predict": 10
                 }
             }
             
-            res = requests.post(OLLAMA_API_URL, json=payload, timeout=12)
+            res = OllamaAIAnalyst._session.post(
+                OLLAMA_API_URL, json=payload, timeout=12
+            )
             if res.status_code == 200:
                 response_text = res.json().get("response", "7").strip()
                 digits = [int(s) for s in response_text.split() if s.isdigit()]
@@ -673,10 +692,17 @@ class MemoryLearningEngine:
             connection.close()
 
     @staticmethod
-    def perceptual_hash(image_path):
-        image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    def perceptual_hash(image_source):
+        if isinstance(image_source, bytes):
+            image = cv2.imdecode(
+                np.frombuffer(image_source, dtype=np.uint8), cv2.IMREAD_GRAYSCALE
+            )
+            source_description = "in-memory frame"
+        else:
+            image = cv2.imread(image_source, cv2.IMREAD_GRAYSCALE)
+            source_description = image_source
         if image is None:
-            raise ValueError(f"Unable to read scene frame: {image_path}")
+            raise ValueError(f"Unable to read scene frame: {source_description}")
         resized = cv2.resize(image, (9, 8), interpolation=cv2.INTER_AREA)
         bits = resized[:, 1:] > resized[:, :-1]
         value = 0
@@ -858,12 +884,9 @@ class MemoryLearningEngine:
             ).fetchone()
         return json.loads(row[0]) if row else None
 
-    def adjust_score_by_memory(self, perceptual_hash, ai_score):
-        if not perceptual_hash:
-            return ai_score
-        candidate = int(perceptual_hash, 16)
+    def get_memory_evaluations(self):
         with self._connect() as connection:
-            rows = connection.execute(
+            return connection.execute(
                 """
                 SELECT perceptual_hash, user_rating
                 FROM scene_evaluations
@@ -871,6 +894,16 @@ class MemoryLearningEngine:
                 ORDER BY evaluated_at DESC
                 """
             ).fetchall()
+
+    def adjust_score_by_memory(self, perceptual_hash, ai_score, evaluations=None):
+        if not perceptual_hash:
+            return ai_score
+        candidate = int(perceptual_hash, 16)
+        rows = (
+            self.get_memory_evaluations()
+            if evaluations is None
+            else evaluations
+        )
 
         best_match = None
         for stored_hash, user_rating in rows:
@@ -1380,6 +1413,21 @@ class VideoProcessingWorker(QThread):
             should_use_ollama = self.use_ollama or use_prompt_vision
             should_rank = should_use_ollama or self.memory_engine.has_evaluations()
             candidate_scenes = []
+            memory_examples = (
+                self.memory_engine.get_few_shot_examples(limit=5)
+                if should_use_ollama
+                else None
+            )
+            memory_profile = (
+                self.memory_engine.get_preference_profile()
+                if should_use_ollama
+                else None
+            )
+            memory_evaluations = (
+                self.memory_engine.get_memory_evaluations()
+                if should_rank
+                else None
+            )
             candidate_count = max(
                 4,
                 min(
@@ -1394,15 +1442,61 @@ class VideoProcessingWorker(QThread):
             probe_duration = max(
                 0.3, cut_durations[len(cut_durations) // 2]
             )
-            temp_dir = os.path.join(self.output_folder, "temp_frames_ai")
-            os.makedirs(temp_dir, exist_ok=True)
             sample_rng = random.Random()
-            sampled_frame_count = 0
+            scan_started_at = time.perf_counter()
+            scan_expected_samples = candidate_count * len(video_files)
+            completed_samples = 0
+            recent_sample_durations = []
+            last_scan_eta_at = scan_started_at
+
+            def report_scan_progress(file_index, video_path, sample_index=None):
+                nonlocal last_scan_eta_at
+                now = time.perf_counter()
+                elapsed = now - scan_started_at
+                remaining_samples = max(
+                    0, scan_expected_samples - completed_samples
+                )
+                average_sample_time = (
+                    sum(recent_sample_durations) / len(recent_sample_durations)
+                    if recent_sample_durations
+                    else 0.0
+                )
+                remaining_seconds = average_sample_time * remaining_samples
+                finish_time = (
+                    datetime.now().astimezone()
+                    + timedelta(seconds=remaining_seconds)
+                )
+                fraction_done = (
+                    min(1.0, completed_samples / scan_expected_samples)
+                    if scan_expected_samples
+                    else 1.0
+                )
+                self.progress_signal.emit(55 + int(12 * fraction_done))
+
+                if now - last_scan_eta_at < 2.0 and sample_index is not None:
+                    return
+                sample_progress = (
+                    f" | sampel video ini {sample_index}/{len(starts)}"
+                    if sample_index is not None
+                    else ""
+                )
+                self.log_signal.emit(
+                    f"⏱️ Penilaian video [{file_index + 1}/{len(video_files)}] "
+                    f"{os.path.basename(video_path)}{sample_progress} | "
+                    f"waktu berjalan {format_elapsed_time(elapsed)} | "
+                    f"sisa ~{format_elapsed_time(remaining_seconds)} | "
+                    f"perkiraan selesai {finish_time.strftime('%H:%M:%S')}"
+                )
+                last_scan_eta_at = now
 
             if should_use_ollama:
                 self.log_signal.emit(
                     f"🤖 Menilai potongan dari seluruh rentang waktu {len(sample_videos)} video "
                     f"dengan Ollama [{self.ollama_model}] dan prompt edit..."
+                )
+                self.log_signal.emit(
+                    "⏳ Perkiraan waktu dan jam selesai diperbarui selama penilaian; "
+                    "sampel awal dapat lebih lama saat model dimuat."
                 )
             else:
                 self.log_signal.emit(
@@ -1420,6 +1514,8 @@ class VideoProcessingWorker(QThread):
                             f"⚠️ Video dilewati karena durasi/frame tidak dapat dibaca: "
                             f"{os.path.basename(video_path)}"
                         )
+                        scan_expected_samples -= candidate_count
+                        report_scan_progress(file_index, video_path)
                         continue
 
                     source_duration = frame_count / fps
@@ -1429,7 +1525,9 @@ class VideoProcessingWorker(QThread):
                         candidate_count,
                         sample_rng,
                     )
-                    for start in starts:
+                    scan_expected_samples += len(starts) - candidate_count
+                    for sample_index, start in enumerate(starts, start=1):
+                        sample_started_at = time.perf_counter()
                         sample_time = min(
                             source_duration - 1.0 / fps,
                             start
@@ -1441,32 +1539,38 @@ class VideoProcessingWorker(QThread):
                         capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
                         ret, frame = capture.read()
                         if not ret:
+                            completed_samples += 1
+                            recent_sample_durations.append(
+                                time.perf_counter() - sample_started_at
+                            )
+                            del recent_sample_durations[:-20]
+                            report_scan_progress(
+                                file_index, video_path, sample_index
+                            )
                             continue
 
-                        frame_path = os.path.join(
-                            temp_dir, f"frame_eval_{sampled_frame_count}.jpg"
-                        )
-                        if not cv2.imwrite(frame_path, frame):
+                        encoded, encoded_frame = cv2.imencode(".jpg", frame)
+                        if not encoded:
                             raise OSError(
-                                f"Gagal menyimpan frame sementara: {frame_path}"
+                                "Gagal mengenkode frame sementara untuk evaluasi."
                             )
-                        try:
-                            frame_hash = self.memory_engine.perceptual_hash(frame_path)
-                            score = 7
-                            if should_use_ollama and video_path in sample_video_set:
-                                score = OllamaAIAnalyst.score_video_clip_with_memory(
-                                    self.ollama_model,
-                                    frame_path,
-                                    self.memory_engine,
-                                    prompt_override=self.prompt_override,
-                                )
-                            if should_rank:
-                                score = self.memory_engine.adjust_score_by_memory(
-                                    frame_hash, score
-                                )
-                        finally:
-                            if os.path.exists(frame_path):
-                                os.remove(frame_path)
+                        image_bytes = encoded_frame.tobytes()
+                        frame_hash = self.memory_engine.perceptual_hash(image_bytes)
+                        score = 7
+                        if should_use_ollama and video_path in sample_video_set:
+                            score = OllamaAIAnalyst.score_video_clip_with_memory(
+                                self.ollama_model,
+                                None,
+                                self.memory_engine,
+                                prompt_override=self.prompt_override,
+                                image_bytes=image_bytes,
+                                examples=memory_examples,
+                                memory_profile=memory_profile,
+                            )
+                        if should_rank:
+                            score = self.memory_engine.adjust_score_by_memory(
+                                frame_hash, score, memory_evaluations
+                            )
 
                         candidate_scenes.append(
                             {
@@ -1478,7 +1582,12 @@ class VideoProcessingWorker(QThread):
                                 "perceptual_hash": frame_hash,
                             }
                         )
-                        sampled_frame_count += 1
+                        completed_samples += 1
+                        recent_sample_durations.append(
+                            time.perf_counter() - sample_started_at
+                        )
+                        del recent_sample_durations[:-20]
+                        report_scan_progress(file_index, video_path, sample_index)
                 finally:
                     capture.release()
 
@@ -1487,12 +1596,15 @@ class VideoProcessingWorker(QThread):
                     f"{os.path.basename(video_path)}: "
                     f"{len(starts)} posisi sampel"
                 )
-                self.progress_signal.emit(
-                    55 + int(12 * (file_index + 1) / len(video_files))
-                )
+                report_scan_progress(file_index, video_path)
 
-            if not os.listdir(temp_dir):
-                os.rmdir(temp_dir)
+            scan_finished_at = datetime.now().astimezone()
+            scan_elapsed = time.perf_counter() - scan_started_at
+            self.log_signal.emit(
+                "✅ Penilaian folder selesai dalam "
+                f"{format_elapsed_time(scan_elapsed)}; "
+                f"selesai pukul {scan_finished_at.strftime('%H:%M:%S')}."
+            )
             if not candidate_scenes:
                 self.error_signal.emit(
                     "Tidak ada frame dari video bahan yang dapat dibaca. "
