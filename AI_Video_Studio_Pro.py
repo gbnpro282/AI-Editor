@@ -48,8 +48,10 @@ OLLAMA_API_URL = "http://localhost:11434/api/generate"
 DEFAULT_VISION_MODEL = "qwen2.5vl:3b"
 
 
-def check_render_quality(video_path, expected_duration=None, timeout=600):
-    """Decode-check a rendered video and flag long black or frozen intervals."""
+def check_render_quality(
+    video_path, expected_duration=None, timeout=600, allow_silent_audio=False
+):
+    """Check media decoding, streams, visual defects, duration, and frame timing."""
     command = [
         "ffmpeg",
         "-hide_banner",
@@ -59,7 +61,7 @@ def check_render_quality(video_path, expected_duration=None, timeout=600):
         "-i",
         video_path,
         "-vf",
-        "blackdetect=d=1.5:pix_th=0.10,freezedetect=n=-50dB:d=2",
+        "blackdetect=d=0.5:pix_th=0.10,freezedetect=n=-50dB:d=0.75",
         "-af",
         "volumedetect",
         "-f",
@@ -190,6 +192,99 @@ def check_render_quality(video_path, expected_duration=None, timeout=600):
             }
         )
 
+    frame_timing_metrics = {}
+    try:
+        timing_result = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_frames",
+                "-show_entries",
+                "frame=best_effort_timestamp_time",
+                "-of",
+                "csv=p=0",
+                video_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        if timing_result.returncode != 0:
+            raise RuntimeError(timing_result.stderr[-1200:] or "ffprobe failed")
+
+        frame_times = []
+        for line in timing_result.stdout.splitlines():
+            value = line.strip().split(",", 1)[0]
+            try:
+                frame_times.append(float(value))
+            except ValueError:
+                continue
+        if not frame_times:
+            raise ValueError("No readable video frame timestamps were found.")
+
+        positive_deltas = [
+            current - previous
+            for previous, current in zip(frame_times, frame_times[1:])
+            if current > previous
+        ]
+        typical_frame_interval = (
+            float(np.median(positive_deltas)) if positive_deltas else 0.0
+        )
+        gap_threshold = max(0.1, typical_frame_interval * 3)
+        timing_anomalies = []
+        for previous, current in zip(frame_times, frame_times[1:]):
+            interval = current - previous
+            if interval <= 0:
+                kind = "non-monotonic"
+            elif interval > gap_threshold:
+                kind = "gap"
+            elif typical_frame_interval and interval < typical_frame_interval / 3:
+                kind = "compressed"
+            else:
+                continue
+            if kind is not None:
+                timing_anomalies.append(
+                    {
+                        "start": previous,
+                        "end": current,
+                        "duration": interval,
+                        "kind": kind,
+                    }
+                )
+
+        frame_timing_metrics = {
+            "frame_count": len(frame_times),
+            "typical_frame_interval_seconds": typical_frame_interval,
+            "frame_timing_anomaly_count": len(timing_anomalies),
+        }
+        for anomaly in timing_anomalies[:20]:
+            findings.append(
+                {
+                    "severity": "warning",
+                    "code": "irregular_frame_timing",
+                    "message": (
+                        "Possible playback lag/buffering or a sudden speed change "
+                        f"near {anomaly['start']:.2f}s "
+                        f"({anomaly['kind']} frame timing)."
+                    ),
+                    **anomaly,
+                }
+            )
+    except (OSError, subprocess.SubprocessError, RuntimeError, ValueError) as error:
+        findings.append(
+            {
+                "severity": "error",
+                "code": "frame_timing_check_failed",
+                "message": f"Frame timing could not be verified: {error}",
+            }
+        )
+
     volume_match = re.search(r"mean_volume:\s*([-\w.]+)\s*dB", output)
     duration_match = re.search(
         r"Duration:\s*(\d{2}):(\d{2}):(\d{2}(?:\.\d+)?)", output
@@ -214,13 +309,34 @@ def check_render_quality(video_path, expected_duration=None, timeout=600):
                     }
                 )
 
+    if current_freeze_start is not None and duration_seconds is not None:
+        trailing_freeze_duration = max(0.0, duration_seconds - current_freeze_start)
+        if trailing_freeze_duration >= 0.75:
+            segment = {
+                "start": current_freeze_start,
+                "end": duration_seconds,
+                "duration": trailing_freeze_duration,
+            }
+            freeze_segments.append(segment)
+            findings.append(
+                {
+                    "severity": "warning",
+                    "code": "long_frozen_interval",
+                    "message": (
+                        f"Potentially frozen interval ({trailing_freeze_duration:.2f}s); "
+                        "review to distinguish a glitch from an intentional still shot."
+                    ),
+                    **segment,
+                }
+            )
+
     mean_volume_db = volume_match.group(1) if volume_match else None
     if mean_volume_db is not None:
         try:
             nearly_silent_audio = float(mean_volume_db) <= -60.0
         except ValueError:
             nearly_silent_audio = mean_volume_db.casefold() == "-inf"
-        if nearly_silent_audio:
+        if nearly_silent_audio and not allow_silent_audio:
             findings.append(
                 {
                     "severity": "warning",
@@ -240,6 +356,7 @@ def check_render_quality(video_path, expected_duration=None, timeout=600):
         "black_segments": black_segments,
         "frozen_segments": freeze_segments,
         "mean_audio_volume_db": mean_volume_db,
+        **frame_timing_metrics,
     }
     return {
         "render_path": video_path,
@@ -252,6 +369,110 @@ def check_render_quality(video_path, expected_duration=None, timeout=600):
         "findings": findings,
         "metrics": metrics,
     }
+
+
+def video_has_audio_stream(video_path):
+    """Return whether a source video contains an audio stream."""
+    result = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "a:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
+            video_path,
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        universal_newlines=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Gagal memeriksa audio video bahan: {result.stderr[-1200:]}"
+        )
+    return bool(result.stdout.strip())
+
+
+def replace_problem_scenes(selected_cuts, ranked_scenes, findings, excluded_scenes):
+    """Replace source shots that overlap QC findings with unused sampled alternatives."""
+    affected_indices = set()
+    timeline_position = 0.0
+    for index, cut in enumerate(selected_cuts):
+        cut_start = timeline_position
+        cut_end = cut_start + float(cut["duration"])
+        timeline_position = cut_end
+        for finding in findings:
+            start = finding.get("start")
+            end = finding.get("end")
+            if start is None or end is None:
+                affected_indices.update(range(len(selected_cuts)))
+                break
+            start = float(start)
+            end = max(start, float(end))
+            if (
+                (start < cut_end and end >= cut_start)
+                or (start == end and cut_start <= start < cut_end)
+            ):
+                affected_indices.add(index)
+
+    if not affected_indices:
+        return None
+
+    def scene_id(scene):
+        return (
+            os.path.normcase(os.path.abspath(scene["file"])),
+            round(float(scene["start"]), 3),
+        )
+
+    excluded_scenes.update(scene_id(cut) for cut in selected_cuts)
+    used_scenes = {
+        scene_id(cut)
+        for index, cut in enumerate(selected_cuts)
+        if index not in affected_indices
+    }
+    replacements = [dict(cut) for cut in selected_cuts]
+
+    for index in sorted(affected_indices):
+        cut = selected_cuts[index]
+        replacement = None
+        for candidate in ranked_scenes:
+            candidate_id = scene_id(candidate)
+            if candidate_id in excluded_scenes or candidate_id in used_scenes:
+                continue
+            if float(candidate["source_duration"]) < float(cut["duration"]):
+                continue
+            replacement = dict(cut)
+            replacement.update(
+                {
+                    "file": candidate["file"],
+                    "start": min(
+                        float(candidate["start"]),
+                        max(
+                            0.0,
+                            float(candidate["source_duration"])
+                            - float(cut["duration"]),
+                        ),
+                    ),
+                    "source_duration": candidate["source_duration"],
+                    "ai_predicted_score": candidate["score"],
+                    "perceptual_hash": candidate["perceptual_hash"],
+                }
+            )
+            used_scenes.add(candidate_id)
+            excluded_scenes.add(candidate_id)
+            break
+        if replacement is None:
+            return None
+        replacements[index] = replacement
+
+    return replacements
 
 
 def build_temporal_sample_starts(
@@ -1006,22 +1227,53 @@ class VideoProcessingWorker(QThread):
             self.log_signal.emit(f"✅ Berhasil menemukan total {len(video_files)} video bahan.")
             self.progress_signal.emit(15)
 
-            # Step 2: Analisis Sound / Musik Utama
-            self.log_signal.emit("🎵 Menganalisis ritme, tempo, & beat musik audio...")
-            beat_analyzer = AudioBeatAnalyzer(self.sound_path)
-            tempo, beats, audio_total_duration = beat_analyzer.get_audio_info()
-            
-            target_duration = audio_total_duration if self.is_full_sound else min(self.max_duration, audio_total_duration)
-            self.log_signal.emit(f"🎶 Tempo Audio: {tempo:.1f} BPM | Total Beat Points: {len(beats)}")
+            # Step 2: Analyze optional soundtrack.
+            if self.sound_path:
+                self.log_signal.emit("🎵 Menganalisis ritme, tempo, & beat musik audio...")
+                beat_analyzer = AudioBeatAnalyzer(self.sound_path)
+                tempo, beats, audio_total_duration = beat_analyzer.get_audio_info()
+                target_duration = (
+                    audio_total_duration
+                    if self.is_full_sound
+                    else min(self.max_duration, audio_total_duration)
+                )
+                self.log_signal.emit(
+                    f"🎶 Tempo Audio: {tempo:.1f} BPM | Total Beat Points: {len(beats)}"
+                )
+            else:
+                tempo, beats = 120.0, []
+                target_duration = self.max_duration
+                self.log_signal.emit(
+                    "🎵 Soundtrack eksternal tidak dipilih; audio akan diambil "
+                    "dari video bahan sesuai opsi mute."
+                )
             self.log_signal.emit(f"⏱️ Durasi Target Output: {target_duration:.1f} detik")
             self.progress_signal.emit(30)
 
-            # Step 3: Analisis Video Referensi (Timing & Struktur Adegan)
-            self.log_signal.emit("🎯 Menganalisis struktur adegan & pola durasi potongan video referensi...")
-            ref_analyzer = ReferenceStyleAnalyzer(self.ref_path)
-            ref_style = ref_analyzer.analyze_style()
+            # Step 3: Analyze optional reference timing.
+            if self.ref_path:
+                self.log_signal.emit(
+                    "🎯 Menganalisis struktur adegan & pola durasi potongan video referensi..."
+                )
+                ref_analyzer = ReferenceStyleAnalyzer(self.ref_path)
+                ref_style = ref_analyzer.analyze_style()
+            else:
+                ref_style = {
+                    "avg_scene_duration": 2.5,
+                    "scene_durations": [2.5],
+                    "scene_cuts": [],
+                    "fps": 60.0,
+                }
+                self.log_signal.emit(
+                    "🎯 Video referensi tidak dipilih; gunakan pola timing default, "
+                    "Memory Learning, dan prompt jika tersedia."
+                )
             ref_durations = ref_style["scene_durations"]
-            self.log_signal.emit(f"📊 Terdeteksi {len(ref_durations)} pola potongan adegan pada video referensi (Rata-rata: {ref_style['avg_scene_duration']:.2f}s)")
+            if self.ref_path:
+                self.log_signal.emit(
+                    f"📊 Terdeteksi {len(ref_durations)} pola potongan adegan pada "
+                    f"video referensi (Rata-rata: {ref_style['avg_scene_duration']:.2f}s)"
+                )
             self.progress_signal.emit(40)
 
             self.progress_signal.emit(55)
@@ -1252,10 +1504,18 @@ class VideoProcessingWorker(QThread):
             ranked_scenes = sorted(
                 candidate_scenes, key=lambda scene: scene["score"], reverse=True
             )
-            chosen_scenes = ranked_scenes[:len(selected_cuts)]
+            alternative_scenes = min(2, max(0, len(ranked_scenes) - 1))
+            initial_scenes = (
+                ranked_scenes[:-alternative_scenes]
+                if alternative_scenes
+                else ranked_scenes
+            )
+            chosen_scenes = initial_scenes[:len(selected_cuts)]
             while len(chosen_scenes) < len(selected_cuts):
                 chosen_scenes.append(
-                    ranked_scenes[len(chosen_scenes) % len(ranked_scenes)]
+                    initial_scenes[
+                        len(chosen_scenes) % len(initial_scenes)
+                    ]
                 )
             chosen_scenes.sort(
                 key=lambda scene: (scene["file_index"], scene["start"])
@@ -1283,40 +1543,8 @@ class VideoProcessingWorker(QThread):
                     "secara acak-tersebar dan diurutkan berdasarkan waktu sumber."
                 )
 
-            # Build the review timeline from the exact durations supplied to FFmpeg.
-            scene_metadata = []
-            timeline_position = 0.0
-            for scene_index, cut in enumerate(selected_cuts):
-                scene_start = timeline_position
-                scene_end = scene_start + float(cut["duration"])
-                perceptual_hash = cut["perceptual_hash"]
-
-                scene_id = hashlib.sha256(
-                    (
-                        os.path.abspath(cut["file"])
-                        + f"|{scene_index}|{scene_start:.6f}|{scene_end:.6f}|"
-                        + perceptual_hash
-                    ).encode("utf-8")
-                ).hexdigest()[:16]
-                scene_metadata.append(
-                    {
-                        "scene_id": f"hash_{scene_id}",
-                        "source_file": cut["file"],
-                        "clip_duration": float(cut["duration"]),
-                        "ai_predicted_score": cut["ai_predicted_score"],
-                        "external_prompt": self.prompt_override,
-                        "perceptual_hash": perceptual_hash,
-                        "timestamp_range": [scene_start, scene_end],
-                    }
-                )
-                timeline_position = scene_end
-
             self.progress_signal.emit(70)
             self.log_signal.emit(f"✂️ Berhasil menyusun {len(selected_cuts)} potongan klip video berpresisi tinggi.")
-
-            # Step 6: Rendering Hardware Accelerated GPU NVENC (4K 60 FPS + Audio Mapping Fix)
-            output_filename = f"AI_Render_{self.target_width}x{self.target_height}_60FPS_{int(time.time())}.mp4"
-            final_output_path = os.path.join(self.output_folder, output_filename)
 
             self.log_signal.emit(f"📐 Target Resolusi Video: {self.target_width} x {self.target_height} @ 60FPS NVENC")
             
@@ -1324,89 +1552,259 @@ class VideoProcessingWorker(QThread):
                 self.log_signal.emit("🔇 Opsi Mute Suara Asli Video Bahan: AKTIF (Suara Asli Dihapus 100%)")
             else:
                 self.log_signal.emit("🔊 Opsi Mute Suara Asli Video Bahan: NONAKTIF")
+            has_source_audio = (
+                not self.mute_raw_audio
+                and video_has_audio_stream(selected_cuts[0]["file"])
+            )
+            if not has_source_audio and not self.sound_path:
+                self.log_signal.emit(
+                    "⚠️ Audio video bahan tidak tersedia atau dimute; hasil akan "
+                    "memakai track hening."
+                )
 
             if self.enable_stabilizer:
                 self.log_signal.emit("🛡️ Mode Stabilizer (FFmpeg Deshake): AKTIF")
 
             self.progress_signal.emit(80)
 
-            # File daftar FFmpeg Concat
-            concat_list_path = os.path.join(self.output_folder, "ffmpeg_concat_list.txt")
-            with open(concat_list_path, "w", encoding="utf-8") as f:
-                for cut in selected_cuts:
-                    clean_path = cut['file'].replace('\\', '/').replace("'", "'\\''")
-                    f.write(f"file '{clean_path}'\n")
-                    f.write(f"inpoint {cut['start']:.6f}\n")
-                    f.write(
-                        f"outpoint {cut['start'] + cut['duration']:.6f}\n"
-                    )
-                    f.write(f"duration {cut['duration']:.3f}\n")
-
-            # Membangun rantai filter video FFmpeg (-vf)
-            vf_filters = []
-            if self.enable_stabilizer:
-                vf_filters.append("deshake=x=0:y=0:w=0:h=0:rx=64:ry=64:edge=1")
-            
-            vf_filters.append(f"scale={self.target_width}:{self.target_height}:force_original_aspect_ratio=increase")
-            vf_filters.append(f"crop={self.target_width}:{self.target_height}")
-            vf_filters.append("fps=60")
-            vf_filters.append("format=yuv420p")
-
-            vf_string = ",".join(vf_filters)
-
-            # PERBAIKAN PENTING: Perintah FFmpeg dengan Explicit Stream Mapping (-map 0:v:0 -map 1:a:0)
-            # Menjamin 100% suara musik/audio yang diunggah terdengar jelas dan suara asli video terhapus murni.
-            ffmpeg_cmd = [
-                "ffmpeg", "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", concat_list_path,     # Input 0: Concat Klip Video
-                "-i", self.sound_path,       # Input 1: Soundtrack/Audio Utama
-                "-t", str(target_duration),
-                "-map", "0:v:0",             # Ambil Video dari Concat Klip
-                "-map", "1:a:0",             # Ambil Audio Eksklusif dari File Musik Input 1
-                "-vf", vf_string,
-                "-c:v", "h264_nvenc",
-                "-preset", "p4",
-                "-cq", "19",
-                "-b:v", "35M",
-                "-maxrate", "50M",
-                "-bufsize", "70M",
-                "-c:a", "aac",
-                "-b:a", "320k",
-                "-shortest",
-                final_output_path
-            ]
-
-            self.log_signal.emit("⚡ Menjalankan Enkoder GPU NVIDIA NVENC RTX 4050...")
-            process = subprocess.Popen(
-                ffmpeg_cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True,
-                encoding="utf-8",
-                errors="replace",
+            max_qc_retries = 2
+            excluded_scenes = set()
+            render_base = (
+                f"AI_Render_{self.target_width}x{self.target_height}_60FPS_"
+                f"{int(time.time())}"
             )
+            final_output_path = ""
+            preview_output_path = ""
+            scene_metadata = []
+            quality_report = {}
 
-            for line in process.stdout:
-                if "frame=" in line or "fps=" in line:
-                    self.log_signal.emit(f"🎥 Render Progress: {line.strip()}")
+            for attempt in range(max_qc_retries + 1):
+                scene_metadata = []
+                timeline_position = 0.0
+                for scene_index, cut in enumerate(selected_cuts):
+                    scene_start = timeline_position
+                    scene_end = scene_start + float(cut["duration"])
+                    perceptual_hash = cut["perceptual_hash"]
+                    scene_id = hashlib.sha256(
+                        (
+                            os.path.abspath(cut["file"])
+                            + f"|{scene_index}|{scene_start:.6f}|{scene_end:.6f}|"
+                            + perceptual_hash
+                        ).encode("utf-8")
+                    ).hexdigest()[:16]
+                    scene_metadata.append(
+                        {
+                            "scene_id": f"hash_{scene_id}",
+                            "source_file": cut["file"],
+                            "clip_duration": float(cut["duration"]),
+                            "ai_predicted_score": cut["ai_predicted_score"],
+                            "external_prompt": self.prompt_override,
+                            "perceptual_hash": perceptual_hash,
+                            "timestamp_range": [scene_start, scene_end],
+                        }
+                    )
+                    timeline_position = scene_end
 
-            process.wait()
-
-            if os.path.exists(concat_list_path):
-                os.remove(concat_list_path)
-
-            if process.returncode == 0:
-                self.log_signal.emit(
-                    "🔎 Memeriksa file hasil render untuk frame rusak, "
-                    "layar hitam panjang, video freeze, serta stream audio/video..."
+                attempt_suffix = f"_QC_RETRY{attempt}" if attempt else ""
+                final_output_path = os.path.join(
+                    self.output_folder, f"{render_base}{attempt_suffix}.mp4"
                 )
-                quality_report = check_render_quality(
+                preview_output_path = (
+                    os.path.splitext(final_output_path)[0] + "_preview.wmv"
+                )
+                concat_list_path = os.path.join(
+                    self.output_folder, "ffmpeg_concat_list.txt"
+                )
+                self.progress_signal.emit(80)
+                with open(concat_list_path, "w", encoding="utf-8") as concat_file:
+                    for cut in selected_cuts:
+                        clean_path = (
+                            cut["file"].replace("\\", "/").replace("'", "'\\''")
+                        )
+                        concat_file.write(f"file '{clean_path}'\n")
+                        concat_file.write(f"inpoint {cut['start']:.6f}\n")
+                        concat_file.write(
+                            f"outpoint {cut['start'] + cut['duration']:.6f}\n"
+                        )
+                        concat_file.write(f"duration {cut['duration']:.3f}\n")
+
+                vf_filters = []
+                if self.enable_stabilizer:
+                    vf_filters.append(
+                        "deshake=x=0:y=0:w=0:h=0:rx=64:ry=64:edge=1"
+                    )
+                vf_filters.extend(
+                    [
+                        f"scale={self.target_width}:{self.target_height}:"
+                        "force_original_aspect_ratio=increase",
+                        f"crop={self.target_width}:{self.target_height}",
+                        "fps=60",
+                        "format=yuv420p",
+                    ]
+                )
+                ffmpeg_cmd = [
+                    "ffmpeg", "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", concat_list_path,
+                ]
+                if self.sound_path:
+                    ffmpeg_cmd.extend(["-i", self.sound_path])
+                    if has_source_audio:
+                        ffmpeg_cmd.extend(
+                            [
+                                "-filter_complex",
+                                "[1:a:0]aresample=48000[music];"
+                                "[0:a:0]aresample=48000[source];"
+                                "[music][source]amix=inputs=2:duration=first:"
+                                "dropout_transition=2[aout]",
+                                "-map",
+                                "[aout]",
+                            ]
+                        )
+                    else:
+                        ffmpeg_cmd.extend(["-map", "1:a:0"])
+                elif has_source_audio:
+                    ffmpeg_cmd.extend(["-map", "0:a:0"])
+                else:
+                    ffmpeg_cmd.extend(
+                        [
+                            "-f",
+                            "lavfi",
+                            "-t",
+                            str(target_duration),
+                            "-i",
+                            "anullsrc=channel_layout=stereo:sample_rate=48000",
+                            "-map",
+                            "1:a:0",
+                        ]
+                    )
+                ffmpeg_cmd.extend([
+                    "-t", str(target_duration),
+                    "-map", "0:v:0",
+                    "-vf", ",".join(vf_filters),
+                    "-c:v", "h264_nvenc",
+                    "-preset", "p4",
+                    "-cq", "19",
+                    "-b:v", "35M",
+                    "-maxrate", "50M",
+                    "-bufsize", "70M",
+                    "-c:a", "aac",
+                    "-b:a", "320k",
+                    "-shortest",
+                    final_output_path,
+                ])
+
+                if attempt:
+                    self.log_signal.emit(
+                        f"QC gagal; merender ulang dengan adegan alternatif "
+                        f"(percobaan {attempt}/{max_qc_retries})."
+                    )
+                self.log_signal.emit("Menjalankan Enkoder GPU NVIDIA NVENC RTX 4050...")
+                process = subprocess.Popen(
+                    ffmpeg_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    universal_newlines=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                for line in process.stdout:
+                    if "frame=" in line or "fps=" in line:
+                        self.log_signal.emit(f"Render Progress: {line.strip()}")
+                process.wait()
+                if os.path.exists(concat_list_path):
+                    os.remove(concat_list_path)
+                if process.returncode != 0:
+                    self.error_signal.emit(
+                        "Gagal merender video dengan FFmpeg! Periksa keterhubungan "
+                        "file audio & driver GPU."
+                    )
+                    return
+
+                self.log_signal.emit(
+                    "QC hasil render: decode, frame hitam/beku, audio/video, "
+                    "durasi, dan kelancaran timestamp."
+                )
+                render_report = check_render_quality(
                     final_output_path,
                     expected_duration=target_duration,
                     timeout=max(120, int(target_duration * 3)),
+                    allow_silent_audio=not self.sound_path,
                 )
+                quality_report = render_report
+
+                if render_report["status"] == "ok":
+                    preview_cmd = [
+                        "ffmpeg", "-y",
+                        "-i", final_output_path,
+                        "-map", "0:v:0",
+                        "-map", "0:a:0?",
+                        "-vf", "scale=-2:720,fps=30,format=yuv420p",
+                        "-c:v", "wmv2",
+                        "-q:v", "4",
+                        "-c:a", "wmav2",
+                        "-b:a", "192k",
+                        "-ar", "44100",
+                        "-ac", "2",
+                        "-shortest",
+                        preview_output_path,
+                    ]
+                    self.log_signal.emit(
+                        "Menyiapkan dan memeriksa preview kompatibel Windows..."
+                    )
+                    preview_process = subprocess.run(
+                        preview_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        universal_newlines=True,
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+                    if preview_process.returncode != 0:
+                        quality_report["findings"].append(
+                            {
+                                "severity": "error",
+                                "code": "preview_creation_failed",
+                                "message": (
+                                    "Preview WMV gagal dibuat: "
+                                    + preview_process.stderr[-1200:]
+                                ),
+                            }
+                        )
+                        quality_report["status"] = "error"
+                    else:
+                        preview_report = check_render_quality(
+                            preview_output_path,
+                            expected_duration=target_duration,
+                            timeout=max(120, int(target_duration * 3)),
+                            allow_silent_audio=not self.sound_path,
+                        )
+                        quality_report = {
+                            **render_report,
+                            "findings": (
+                                render_report["findings"]
+                                + preview_report["findings"]
+                            ),
+                            "metrics": {
+                                "render": render_report["metrics"],
+                                "preview": preview_report["metrics"],
+                            },
+                            "status": (
+                                "error"
+                                if "error" in (
+                                    render_report["status"],
+                                    preview_report["status"],
+                                )
+                                else "warning"
+                                if (
+                                    render_report["findings"]
+                                    or preview_report["findings"]
+                                )
+                                else "ok"
+                            ),
+                        }
+
                 try:
                     self.memory_engine.save_quality_check(quality_report)
                 except (OSError, sqlite3.Error, TypeError, ValueError) as error:
@@ -1420,63 +1818,58 @@ class VideoProcessingWorker(QThread):
                     quality_report["status"] = "error"
 
                 if quality_report["status"] == "ok":
-                    self.log_signal.emit(
-                        "✅ Pemeriksaan otomatis selesai: stream dapat dibaca; "
-                        "tidak ditemukan indikasi black frame panjang atau freeze."
-                    )
-                else:
-                    self.log_signal.emit(
-                        f"⚠️ Pemeriksaan otomatis menemukan "
-                        f"{len(quality_report['findings'])} hal yang perlu ditinjau."
-                    )
-                    for finding in quality_report["findings"][:8]:
-                        self.log_signal.emit(f"   • {finding['message']}")
+                    break
 
-                preview_output_path = os.path.splitext(final_output_path)[0] + "_preview.wmv"
-                preview_cmd = [
-                    "ffmpeg", "-y",
-                    "-i", final_output_path,
-                    "-map", "0:v:0",
-                    "-map", "0:a:0?",
-                    "-vf", "scale=-2:720,fps=30,format=yuv420p",
-                    "-c:v", "wmv2",
-                    "-q:v", "4",
-                    "-c:a", "wmav2",
-                    "-b:a", "192k",
-                    "-ar", "44100",
-                    "-ac", "2",
-                    "-shortest",
-                    preview_output_path,
-                ]
                 self.log_signal.emit(
-                    "🎞️ Menyiapkan preview kompatibel Windows (WMV2 + audio)..."
+                    f"QC menemukan {len(quality_report['findings'])} masalah:"
                 )
-                preview_process = subprocess.run(
-                    preview_cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-                if preview_process.returncode != 0:
+                for finding in quality_report["findings"][:8]:
+                    self.log_signal.emit(f"   - {finding['message']}")
+
+                if any(
+                    finding["code"] == "quality_report_not_saved"
+                    for finding in quality_report["findings"]
+                ):
                     self.error_signal.emit(
-                        "Render MP4 berhasil, tetapi preview WMV tidak dapat dibuat. "
-                        f"Hasil render tetap tersedia di:\n{final_output_path}\n\n"
-                        f"FFmpeg: {preview_process.stderr[-2000:]}"
+                        "Laporan QC tidak dapat disimpan. Preview dan download "
+                        "ditahan agar hasil yang belum terverifikasi tidak digunakan."
                     )
                     return
-                self.progress_signal.emit(100)
-                self.log_signal.emit(f"🎉 RENDER SUKSES! Video 4K 60FPS dengan Sound Jelas disimpan di:\n{final_output_path}")
-                self.finished_signal.emit(
-                    final_output_path,
-                    scene_metadata,
-                    preview_output_path,
-                    quality_report,
-                )
-            else:
-                self.error_signal.emit("Gagal merender video dengan FFmpeg! Periksa keterhubungan file audio & driver GPU.")
+                if attempt == max_qc_retries:
+                    break
 
+                replacement_cuts = replace_problem_scenes(
+                    selected_cuts,
+                    ranked_scenes,
+                    quality_report["findings"],
+                    excluded_scenes,
+                )
+                if replacement_cuts is None:
+                    break
+                selected_cuts = replacement_cuts
+
+            if quality_report["status"] != "ok":
+                findings_text = "\n".join(
+                    f"- {finding['message']}"
+                    for finding in quality_report.get("findings", [])[:8]
+                )
+                self.error_signal.emit(
+                    "QC belum lolos setelah mencoba adegan alternatif. Preview dan "
+                    "download ditahan. Periksa file sumber atau jalankan ulang edit."
+                    + (f"\n\n{findings_text}" if findings_text else "")
+                )
+                return
+
+            self.progress_signal.emit(100)
+            self.log_signal.emit(
+                f"QC render dan preview lulus. Hasil siap ditinjau: {final_output_path}"
+            )
+            self.finished_signal.emit(
+                final_output_path,
+                scene_metadata,
+                preview_output_path,
+                quality_report,
+            )
         except Exception as e:
             self.error_signal.emit(f"Error tidak terduga pada pipeline: {str(e)}")
 
@@ -1556,17 +1949,33 @@ class AIStudioPanel(QMainWindow):
 
         # 2. Sound/Audio File Input
         self.txt_sound_path = QLineEdit()
-        self.txt_sound_path.setPlaceholderText("Pilih file musik/soundtrack (.mp3, .wav)...")
+        self.txt_sound_path.setPlaceholderText(
+            "Opsional — pilih musik/soundtrack; kosong = gunakan audio video bahan"
+        )
         btn_browse_sound = QPushButton("Browse Audio")
         btn_browse_sound.clicked.connect(self.browse_sound_file)
-        form_layout.addLayout(self.create_form_row("🎵 Sound / Musik Utama:", self.txt_sound_path, btn_browse_sound))
+        form_layout.addLayout(
+            self.create_form_row(
+                "🎵 Sound / Musik Utama (Opsional):",
+                self.txt_sound_path,
+                btn_browse_sound,
+            )
+        )
 
         # 3. Reference Video Input
         self.txt_ref_path = QLineEdit()
-        self.txt_ref_path.setPlaceholderText("Pilih video referensi gaya/transisi/animasi (.mp4)...")
+        self.txt_ref_path.setPlaceholderText(
+            "Opsional — kosong = gunakan Memory Learning dan prompt"
+        )
         btn_browse_ref = QPushButton("Browse Referensi")
         btn_browse_ref.clicked.connect(self.browse_ref_file)
-        form_layout.addLayout(self.create_form_row("🎯 Video Referensi Gaya:", self.txt_ref_path, btn_browse_ref))
+        form_layout.addLayout(
+            self.create_form_row(
+                "🎯 Video Referensi Gaya (Opsional):",
+                self.txt_ref_path,
+                btn_browse_ref,
+            )
+        )
 
         # 4. Save Output Location Input
         self.txt_output_folder = QLineEdit()
@@ -1581,7 +1990,7 @@ class AIStudioPanel(QMainWindow):
         
         # Audio Mute Checkbox
         self.chk_mute_raw = QCheckBox("🔇 Hapus Suara Asli Video Bahan (Mute Raw Audio)")
-        self.chk_mute_raw.setChecked(True)
+        self.chk_mute_raw.setChecked(False)
         self.chk_mute_raw.setFont(QFont("Segoe UI", 9, QFont.Bold))
         
         # Timing Mode Dropdown
@@ -1815,6 +2224,13 @@ class AIStudioPanel(QMainWindow):
                 return
             except Exception as e:
                 pass
+        if not sound_path:
+            self.is_full_sound_selected = False
+            self.append_log(
+                "🎵 Soundtrack belum dipilih; durasi akan mengikuti batas "
+                "durasi yang diatur."
+            )
+            return
         self.append_log("🎵 Mode Full Sound Aktif (Akan otomatis menyesuaikan durasi audio saat proses berjalan).")
 
     def on_slider_changed(self, value):
@@ -1879,10 +2295,10 @@ class AIStudioPanel(QMainWindow):
         if not os.path.exists(raw_folder):
             QMessageBox.warning(self, "Input Error", "Silakan pilih folder video bahan yang valid!")
             return
-        if not os.path.exists(sound_path):
+        if sound_path and not os.path.isfile(sound_path):
             QMessageBox.warning(self, "Input Error", "Silakan pilih file sound/audio yang valid!")
             return
-        if not os.path.exists(ref_path):
+        if ref_path and not os.path.isfile(ref_path):
             QMessageBox.warning(self, "Input Error", "Silakan pilih file video referensi yang valid!")
             return
         if not os.path.exists(output_folder):
@@ -1928,8 +2344,9 @@ class AIStudioPanel(QMainWindow):
         status = report.get("status", "error")
         if status == "ok":
             return (
-                "✅ Pemeriksaan otomatis selesai. File dapat dibaca dan tidak ada "
-                "indikasi frame hitam panjang atau video freeze. Tetap tinjau preview."
+                "✅ QC render dan preview lulus: file dapat dibaca, durasi/audio/video "
+                "valid, dan tidak ada indikasi freeze, layar hitam, atau gangguan timing. "
+                "Tetap tinjau preview sebelum menyimpan."
             )
 
         title = (
