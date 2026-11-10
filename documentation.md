@@ -21,6 +21,7 @@ AI Local Video Editor Studio Pro is a desktop application for assembling source 
 - Enter an optional per-edit **External Promt** in the setup panel; Ollama combines it with saved ratings, comments, and previous prompts when selecting scenes.
 - Save a reviewed render to a chosen location or regenerate the edit using saved ratings and an optional global prompt.
 - Scan all source videos or limit the AI scan to the first 30 videos.
+- Recursively filter temporary, cache, Git, and output folders; inspect source files in a CPU-sized worker pool, hash them in 1 MiB chunks, and cache hashes by modification time and size in the local SQLite database.
 - Choose a 9:16, 16:9, 1:1, or 4:5 output size.
 - Set a 15-, 30-, or 60-second duration, or use the full soundtrack duration.
 - Keep or mute source-video audio, mix it with an optional soundtrack, and optionally apply FFmpeg's `deshake` filter.
@@ -79,6 +80,7 @@ python AI_Video_Studio_Pro.py
 ### Notes
 
 - Candidate segments are sampled at randomized positions distributed from the beginning through the end of each source video. With Ollama ranking enabled, the best-rated samples are selected and kept in chronological order within each source file; without it, samples are chosen across the timeline without AI ranking.
+- Source discovery includes nested folders and honors the selected folder's `.gitignore`; `.git`, `.venv`, `node_modules`, `__pycache__`, `Output Video`, `Memory Learning`, `*.tmp`, and `*.preview.*` are excluded. Existing files are still checked for readable video metadata and a decodable frame; unchanged files reuse their cached SHA-256 while the full temporal scene-sampling pass remains enabled.
 - When a soundtrack is selected, it is the primary audio; source-video audio is mixed in when mute is off. Without a soundtrack, source-video audio is used unless muted. If no usable audio is available, a silent track is rendered.
 - Rendering can take substantial time and disk space, especially at 4K. Actual performance depends on the hardware, media, and FFmpeg build.
 - If Ollama is unavailable or a frame cannot be scored, the application may use its built-in default score. Check the application log and terminal output when troubleshooting.
@@ -115,6 +117,7 @@ AI Local Video Editor Studio Pro adalah aplikasi desktop untuk menyusun klip vid
 - Memasukkan **External Promt** opsional untuk tiap edit dari panel pengaturan; Ollama menggabungkannya dengan rating, komentar, dan prompt edit sebelumnya saat memilih adegan.
 - Menyimpan hasil render ke lokasi pilihan atau membuat ulang edit dengan rating tersimpan dan prompt global opsional.
 - Memindai semua video bahan atau membatasi pemindaian AI pada 30 video pertama.
+- Memfilter folder sementara/cache/Git/output secara rekursif; memeriksa berkas melalui worker pool sesuai jumlah inti CPU, menghitung hash per blok 1 MiB, dan menyimpan cache hash berdasarkan waktu modifikasi serta ukuran di database SQLite lokal.
 - Mempercepat evaluasi sampel dengan memakai ulang frame JPEG di memori, koneksi Ollama lokal, data preferensi yang di-cache, dan menjaga model tetap dimuat selama penilaian; menampilkan pembaruan sisa waktu dan perkiraan selesai tanpa mengubah cakupan sampel atau pengaturan kualitas gambar.
 - Memilih ukuran output 9:16, 16:9, 1:1, atau 4:5.
 - Mengatur durasi 15, 30, atau 60 detik, atau mengikuti durasi penuh soundtrack.
@@ -174,6 +177,7 @@ python AI_Video_Studio_Pro.py
 ### Catatan
 
 - Kandidat klip diambil dari posisi acak-tersebar mulai awal sampai akhir setiap video bahan. Jika pemeringkatan Ollama aktif, sampel dengan skor terbaik dipilih dan dijaga urutan waktunya dalam setiap file sumber; jika tidak, sampel dipilih dari berbagai waktu tanpa pemeringkatan AI.
+- Pencarian video mencakup subfolder dan mengikuti `.gitignore` pada folder yang dipilih; `.git`, `.venv`, `node_modules`, `__pycache__`, `Output Video`, `Memory Learning`, `*.tmp`, dan `*.preview.*` dilewati. Aplikasi tetap memeriksa metadata stream dan decode frame; SHA-256 berkas yang tidak berubah digunakan kembali dari cache, sementara pemindaian sampel adegan seluruh rentang waktu tetap berjalan.
 - Jika soundtrack dipilih, soundtrack menjadi audio utama; audio video bahan ikut dicampur saat opsi mute tidak aktif. Tanpa soundtrack, audio video bahan digunakan kecuali dimute. Jika audio tidak tersedia, render memakai track hening.
 - Rendering dapat membutuhkan waktu dan ruang disk yang cukup besar, terutama pada resolusi 4K. Performa aktual bergantung pada perangkat keras, media, dan build FFmpeg.
 - Jika Ollama tidak tersedia atau frame tidak dapat dinilai, aplikasi mungkin menggunakan skor bawaan. Periksa log aplikasi dan keluaran terminal saat melakukan pemecahan masalah.

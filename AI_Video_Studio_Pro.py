@@ -1,6 +1,7 @@
 import sys
 import os
 import hashlib
+import fnmatch
 import json
 import random
 import re
@@ -9,6 +10,8 @@ import sqlite3
 import time
 import subprocess
 import base64
+import queue
+from concurrent.futures import ThreadPoolExecutor
 from collections import Counter
 from contextlib import contextmanager
 import requests
@@ -1207,6 +1210,297 @@ class ReferenceStyleAnalyzer:
             
         return analysis_data
 
+
+class FileScannerEngine:
+    """Find source videos while pruning irrelevant paths before file inspection."""
+
+    EXCLUDED_DIRECTORIES = {
+        "__pycache__",
+        ".git",
+        ".venv",
+        "node_modules",
+        ".cache",
+        "cache",
+        "tmp",
+        "temp",
+        "output video",
+        "memory learning",
+    }
+    EXCLUDED_PATTERNS = ("*.tmp", "*.preview.*")
+
+    def __init__(self, valid_extensions):
+        self.valid_extensions = tuple(
+            extension.casefold() for extension in valid_extensions
+        )
+
+    @staticmethod
+    def _load_gitignore(root):
+        gitignore_path = os.path.join(root, ".gitignore")
+        if not os.path.isfile(gitignore_path):
+            return []
+
+        patterns = []
+        with open(gitignore_path, "r", encoding="utf-8", errors="replace") as rules:
+            for line in rules:
+                pattern = line.strip()
+                if not pattern or pattern.startswith("#"):
+                    continue
+                negated = pattern.startswith("!")
+                if negated:
+                    pattern = pattern[1:]
+                pattern = pattern.lstrip("/").rstrip("/")
+                if pattern:
+                    patterns.append((pattern.replace("\\", "/"), negated))
+        return patterns
+
+    def _is_ignored(self, relative_path, is_directory, gitignore_rules):
+        relative_path = relative_path.replace(os.sep, "/")
+        basename = os.path.basename(relative_path).casefold()
+        if is_directory and basename in self.EXCLUDED_DIRECTORIES:
+            return True
+        if not is_directory and any(
+            fnmatch.fnmatchcase(basename, pattern)
+            for pattern in self.EXCLUDED_PATTERNS
+        ):
+            return True
+
+        ignored = False
+        for pattern, negated in gitignore_rules:
+            pattern = pattern.casefold()
+            matches = fnmatch.fnmatchcase(relative_path.casefold(), pattern)
+            if "/" not in pattern:
+                matches = matches or fnmatch.fnmatchcase(basename, pattern)
+            if matches:
+                ignored = not negated
+        return ignored
+
+    def scan(self, root):
+        root = os.path.abspath(root)
+        if not os.path.isdir(root):
+            raise NotADirectoryError(f"Source folder does not exist: {root}")
+        if os.path.basename(root).casefold() in self.EXCLUDED_DIRECTORIES:
+            return [], [{"path": root, "status": "SKIPPED_FILTER"}]
+
+        gitignore_rules = self._load_gitignore(root)
+        video_files = []
+        skipped_files = []
+
+        def raise_walk_error(error):
+            raise error
+
+        for current_root, directories, filenames in os.walk(
+            root, topdown=True, onerror=raise_walk_error
+        ):
+            relative_root = os.path.relpath(current_root, root)
+            kept_directories = []
+            for directory in directories:
+                relative_path = (
+                    directory
+                    if relative_root == "."
+                    else os.path.join(relative_root, directory)
+                )
+                if not self._is_ignored(relative_path, True, gitignore_rules):
+                    kept_directories.append(directory)
+            directories[:] = kept_directories
+
+            for filename in filenames:
+                if not filename.casefold().endswith(self.valid_extensions):
+                    continue
+                relative_path = (
+                    filename
+                    if relative_root == "."
+                    else os.path.join(relative_root, filename)
+                )
+                path = os.path.join(current_root, filename)
+                if self._is_ignored(relative_path, False, gitignore_rules):
+                    skipped_files.append(
+                        {"path": path, "status": "SKIPPED_FILTER"}
+                    )
+                    continue
+                video_files.append(path)
+
+        video_files.sort(key=lambda path: os.path.relpath(path, root).casefold())
+        return video_files, skipped_files
+
+
+class FileInspectionCache:
+    """Persist file hashes keyed by normalized path, modification time, and size."""
+
+    CHUNK_SIZE = 1024 * 1024
+
+    def __init__(self, database_path):
+        self.database_path = database_path
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS file_inspection_cache (
+                    file_path TEXT PRIMARY KEY,
+                    mtime_ns INTEGER NOT NULL,
+                    file_size INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL
+                )
+                """
+            )
+
+    @contextmanager
+    def _connect(self):
+        connection = sqlite3.connect(self.database_path, timeout=30)
+        try:
+            yield connection
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _cache_key(file_path):
+        return os.path.normcase(os.path.abspath(file_path))
+
+    def get(self, file_path, mtime_ns, file_size):
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT sha256 FROM file_inspection_cache
+                WHERE file_path = ? AND mtime_ns = ? AND file_size = ?
+                """,
+                (self._cache_key(file_path), mtime_ns, file_size),
+            ).fetchone()
+        return row[0] if row else None
+
+    def put(self, file_path, mtime_ns, file_size, sha256):
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO file_inspection_cache
+                    (file_path, mtime_ns, file_size, sha256)
+                VALUES (?, ?, ?, ?)
+                """,
+                (self._cache_key(file_path), mtime_ns, file_size, sha256),
+            )
+
+
+def inspect_video_file(file_path, cache):
+    """Hash a source in bounded chunks and verify that OpenCV can decode a frame."""
+    initial_stat = os.stat(file_path)
+    mtime_ns = initial_stat.st_mtime_ns
+    file_size = initial_stat.st_size
+    cached_hash = cache.get(file_path, mtime_ns, file_size)
+    if cached_hash is None:
+        digest = hashlib.sha256()
+        with open(file_path, "rb") as source_file:
+            while True:
+                chunk = source_file.read(FileInspectionCache.CHUNK_SIZE)
+                if not chunk:
+                    break
+                digest.update(chunk)
+        sha256 = digest.hexdigest()
+        current_stat = os.stat(file_path)
+        if (
+            current_stat.st_mtime_ns != mtime_ns
+            or current_stat.st_size != file_size
+        ):
+            raise OSError("File changed during content inspection.")
+        cache.put(file_path, mtime_ns, file_size, sha256)
+        status = "SUCCESS"
+    else:
+        sha256 = cached_hash
+        status = "SKIPPED_CACHE"
+
+    capture = cv2.VideoCapture(file_path)
+    try:
+        fps = float(capture.get(cv2.CAP_PROP_FPS))
+        frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        if not capture.isOpened() or fps <= 0 or frame_count <= 0:
+            raise ValueError("Video metadata or stream structure is unreadable.")
+        readable, frame = capture.read()
+        if not readable or frame is None:
+            for frame_index in sorted({frame_count // 2, frame_count - 1}):
+                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                readable, frame = capture.read()
+                if readable and frame is not None:
+                    break
+        if not readable or frame is None:
+            raise ValueError("No sampled video frame could be decoded.")
+    finally:
+        capture.release()
+
+    current_stat = os.stat(file_path)
+    if (
+        current_stat.st_mtime_ns != mtime_ns
+        or current_stat.st_size != file_size
+    ):
+        raise OSError("File changed during content inspection.")
+
+    return {
+        "path": file_path,
+        "status": status,
+        "sha256": sha256,
+        "duration": frame_count / fps,
+        "frame_count": frame_count,
+        "fps": fps,
+    }
+
+
+class FileWorkerPoolController:
+    """Run bounded file tasks with producer-consumer queues and per-file errors."""
+
+    def __init__(self):
+        self.max_workers = max(1, min(os.cpu_count() or 1, 4))
+
+    def process(self, file_paths, worker, progress_callback=None):
+        if not file_paths:
+            return []
+
+        tasks = queue.Queue()
+        results = queue.Queue()
+        for file_path in file_paths:
+            tasks.put(file_path)
+        for _ in range(self.max_workers):
+            tasks.put(None)
+
+        def consume_tasks():
+            while True:
+                file_path = tasks.get()
+                if file_path is None:
+                    tasks.task_done()
+                    return
+                try:
+                    result = worker(file_path)
+                    if not isinstance(result, dict):
+                        raise TypeError("File worker must return a result dictionary.")
+                    result = dict(result)
+                    result.setdefault("path", file_path)
+                except Exception as error:
+                    result = {
+                        "path": file_path,
+                        "status": "FAILED",
+                        "error": str(error),
+                    }
+                finally:
+                    tasks.task_done()
+                results.put(result)
+
+        completed_results = []
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            worker_futures = [
+                executor.submit(consume_tasks)
+                for _ in range(self.max_workers)
+            ]
+            for completed_count in range(1, len(file_paths) + 1):
+                result = results.get()
+                completed_results.append(result)
+                if progress_callback:
+                    progress_callback(
+                        completed_count, len(file_paths), result
+                    )
+            for future in worker_futures:
+                future.result()
+
+        return completed_results
+
+
 # ==============================================================================
 # ENGINE 4: MULTI-THREADED RENDER & AI EDITING WORKER
 # ==============================================================================
@@ -1247,17 +1541,69 @@ class VideoProcessingWorker(QThread):
             # Step 1: Scan Seluruh File Video Bahan di Folder
             self.log_signal.emit(f"📂 Memindai seluruh folder video bahan: {self.raw_folder}")
             valid_extensions = ('.mp4', '.mov', '.avi', '.mkv')
-            video_files = [
-                os.path.join(self.raw_folder, f) for f in os.listdir(self.raw_folder)
-                if f.lower().endswith(valid_extensions)
-            ]
-            video_files.sort(key=lambda path: os.path.basename(path).casefold())
+            scanner = FileScannerEngine(valid_extensions)
+            video_files, filtered_files = scanner.scan(self.raw_folder)
+            if filtered_files:
+                self.log_signal.emit(
+                    f"⏭️ {len(filtered_files)} video dilewati oleh filter "
+                    "direktori/pola pengecualian."
+                )
 
             if not video_files:
                 self.error_signal.emit("Tidak ada file video valid (.mp4, .mov, .avi, .mkv) di folder bahan!")
                 return
 
-            self.log_signal.emit(f"✅ Berhasil menemukan total {len(video_files)} video bahan.")
+            self.log_signal.emit(
+                f"✅ Berhasil menemukan {len(video_files)} kandidat video bahan; "
+                "memulai inspeksi konten paralel."
+            )
+            inspection_cache = FileInspectionCache(
+                self.memory_engine.database_path
+            )
+            inspection_pool = FileWorkerPoolController()
+
+            def report_inspection_progress(completed, total, result):
+                self.progress_signal.emit(5 + int(10 * completed / total))
+                if result["status"] == "FAILED":
+                    self.log_signal.emit(
+                        f"⚠️ Video gagal diinspeksi dan dilewati: "
+                        f"{os.path.basename(result['path'])} ({result['error']})"
+                    )
+
+            inspection_results = inspection_pool.process(
+                video_files,
+                lambda path: inspect_video_file(path, inspection_cache),
+                report_inspection_progress,
+            )
+            video_files = [
+                result["path"]
+                for result in inspection_results
+                if result["status"] in ("SUCCESS", "SKIPPED_CACHE")
+            ]
+            video_files.sort(
+                key=lambda path: os.path.relpath(
+                    path, self.raw_folder
+                ).casefold()
+            )
+            cache_hits = sum(
+                result["status"] == "SKIPPED_CACHE"
+                for result in inspection_results
+            )
+            failed_inspections = sum(
+                result["status"] == "FAILED"
+                for result in inspection_results
+            )
+            self.log_signal.emit(
+                f"✅ Inspeksi selesai: {len(video_files)} valid, "
+                f"{cache_hits} hash dari cache, {failed_inspections} gagal."
+            )
+            if not video_files:
+                self.error_signal.emit(
+                    "Tidak ada file video yang lolos inspeksi struktur. "
+                    "Periksa file video atau codec-nya."
+                )
+                return
+
             self.progress_signal.emit(15)
 
             # Step 2: Analyze optional soundtrack.
