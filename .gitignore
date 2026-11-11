@@ -1,3 +1,4 @@
 # Mengecualikan folder memori dan output video
 Memory Learning/
-Output Video/ 
+Output Video/
+.file_scan_cache.db

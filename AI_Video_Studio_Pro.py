@@ -10,8 +10,8 @@ import sqlite3
 import time
 import subprocess
 import base64
-import queue
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import Counter
 from contextlib import contextmanager
 import requests
@@ -23,13 +23,30 @@ from datetime import datetime, timedelta
 # ==============================================================================
 # AUTOMATIC ENVIRONMENT SETUP & PATH INJECTION
 # ==============================================================================
-# Otomatis mendeteksi dan mendaftarkan jalur ffmpeg.exe dari AppData jika belum ada di PATH
+def _find_ffmpeg_directory(search_root):
+    pending_directories = [search_root]
+    while pending_directories:
+        current_root = pending_directories.pop()
+        try:
+            with os.scandir(current_root) as entries:
+                for entry in entries:
+                    if (
+                        entry.name.casefold() == "ffmpeg.exe"
+                        and entry.is_file(follow_symlinks=False)
+                    ):
+                        return current_root
+                    if entry.is_dir(follow_symlinks=False):
+                        pending_directories.append(entry.path)
+        except PermissionError:
+            continue
+    return None
+
+
 appdata_local = os.environ.get("LOCALAPPDATA", "")
 if appdata_local and os.path.exists(appdata_local):
-    for root, dirs, files in os.walk(appdata_local):
-        if "ffmpeg.exe" in files:
-            os.environ["PATH"] += f";{root}"
-            break
+    ffmpeg_directory = _find_ffmpeg_directory(appdata_local)
+    if ffmpeg_directory:
+        os.environ["PATH"] += f";{ffmpeg_directory}"
 
 # PyQt5 GUI Framework
 from PyQt5.QtWidgets import (
@@ -410,9 +427,13 @@ def video_has_audio_stream(video_path):
     return bool(result.stdout.strip())
 
 
-def replace_problem_scenes(selected_cuts, ranked_scenes, findings, excluded_scenes):
+def replace_problem_scenes(
+    selected_cuts, ranked_scenes, findings, excluded_scenes, replace_all=False
+):
     """Replace source shots that overlap QC findings with unused sampled alternatives."""
-    affected_indices = set()
+    affected_indices = (
+        set(range(len(selected_cuts))) if replace_all else set()
+    )
     timeline_position = 0.0
     for index, cut in enumerate(selected_cuts):
         cut_start = timeline_position
@@ -441,7 +462,8 @@ def replace_problem_scenes(selected_cuts, ranked_scenes, findings, excluded_scen
             round(float(scene["start"]), 3),
         )
 
-    excluded_scenes.update(scene_id(cut) for cut in selected_cuts)
+    next_excluded_scenes = set(excluded_scenes)
+    next_excluded_scenes.update(scene_id(cut) for cut in selected_cuts)
     used_scenes = {
         scene_id(cut)
         for index, cut in enumerate(selected_cuts)
@@ -454,7 +476,10 @@ def replace_problem_scenes(selected_cuts, ranked_scenes, findings, excluded_scen
         replacement = None
         for candidate in ranked_scenes:
             candidate_id = scene_id(candidate)
-            if candidate_id in excluded_scenes or candidate_id in used_scenes:
+            if (
+                candidate_id in next_excluded_scenes
+                or candidate_id in used_scenes
+            ):
                 continue
             if float(candidate["source_duration"]) < float(cut["duration"]):
                 continue
@@ -476,12 +501,13 @@ def replace_problem_scenes(selected_cuts, ranked_scenes, findings, excluded_scen
                 }
             )
             used_scenes.add(candidate_id)
-            excluded_scenes.add(candidate_id)
+            next_excluded_scenes.add(candidate_id)
             break
         if replacement is None:
             return None
         replacements[index] = replacement
 
+    excluded_scenes.update(next_excluded_scenes)
     return replacements
 
 
@@ -1218,6 +1244,7 @@ class FileScannerEngine:
         "__pycache__",
         ".git",
         ".venv",
+        ".idea",
         "node_modules",
         ".cache",
         "cache",
@@ -1226,7 +1253,7 @@ class FileScannerEngine:
         "output video",
         "memory learning",
     }
-    EXCLUDED_PATTERNS = ("*.tmp", "*.preview.*")
+    EXCLUDED_PATTERNS = ("*.tmp", "*.preview.*", "*.log", "*.bak")
 
     def __init__(self, valid_extensions):
         self.valid_extensions = tuple(
@@ -1274,139 +1301,221 @@ class FileScannerEngine:
                 ignored = not negated
         return ignored
 
-    def scan(self, root):
+    def iter_files(self, root):
         root = os.path.abspath(root)
+        self.skipped_count = 0
         if not os.path.isdir(root):
             raise NotADirectoryError(f"Source folder does not exist: {root}")
         if os.path.basename(root).casefold() in self.EXCLUDED_DIRECTORIES:
-            return [], [{"path": root, "status": "SKIPPED_FILTER"}]
+            return
 
         gitignore_rules = self._load_gitignore(root)
-        video_files = []
-        skipped_files = []
+        pending_directories = [root]
+        while pending_directories:
+            current_root = pending_directories.pop()
+            with os.scandir(current_root) as entries:
+                for entry in entries:
+                    relative_path = os.path.relpath(entry.path, root)
+                    if entry.is_dir(follow_symlinks=False):
+                        if not self._is_ignored(
+                            relative_path, True, gitignore_rules
+                        ):
+                            pending_directories.append(entry.path)
+                        continue
 
-        def raise_walk_error(error):
-            raise error
-
-        for current_root, directories, filenames in os.walk(
-            root, topdown=True, onerror=raise_walk_error
-        ):
-            relative_root = os.path.relpath(current_root, root)
-            kept_directories = []
-            for directory in directories:
-                relative_path = (
-                    directory
-                    if relative_root == "."
-                    else os.path.join(relative_root, directory)
-                )
-                if not self._is_ignored(relative_path, True, gitignore_rules):
-                    kept_directories.append(directory)
-            directories[:] = kept_directories
-
-            for filename in filenames:
-                if not filename.casefold().endswith(self.valid_extensions):
-                    continue
-                relative_path = (
-                    filename
-                    if relative_root == "."
-                    else os.path.join(relative_root, filename)
-                )
-                path = os.path.join(current_root, filename)
-                if self._is_ignored(relative_path, False, gitignore_rules):
-                    skipped_files.append(
-                        {"path": path, "status": "SKIPPED_FILTER"}
-                    )
-                    continue
-                video_files.append(path)
-
-        video_files.sort(key=lambda path: os.path.relpath(path, root).casefold())
-        return video_files, skipped_files
+                    if not entry.name.casefold().endswith(self.valid_extensions):
+                        continue
+                    if self._is_ignored(relative_path, False, gitignore_rules):
+                        self.skipped_count += 1
+                        continue
+                    yield entry.path
 
 
 class FileInspectionCache:
-    """Persist file hashes keyed by normalized path, modification time, and size."""
+    """Persist successful deep inspections keyed by path, size, and mtime."""
 
-    CHUNK_SIZE = 1024 * 1024
+    CHUNK_SIZE = 65536
 
     def __init__(self, database_path):
         self.database_path = database_path
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS file_inspection_cache (
-                    file_path TEXT PRIMARY KEY,
-                    mtime_ns INTEGER NOT NULL,
-                    file_size INTEGER NOT NULL,
-                    sha256 TEXT NOT NULL
+        self._lock = threading.Lock()
+        self._connection = sqlite3.connect(
+            database_path, timeout=5, check_same_thread=False
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS file_inspection_cache (
+                file_path TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL,
+                deep_scan_status TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                duration REAL NOT NULL,
+                frame_count INTEGER NOT NULL,
+                fps REAL NOT NULL,
+                PRIMARY KEY (
+                    file_path, file_size, mtime_ns, deep_scan_status
                 )
-                """
             )
-
-    @contextmanager
-    def _connect(self):
-        connection = sqlite3.connect(self.database_path, timeout=30)
-        try:
-            yield connection
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+            """
+        )
+        self._connection.commit()
 
     @staticmethod
     def _cache_key(file_path):
         return os.path.normcase(os.path.abspath(file_path))
 
     def get(self, file_path, mtime_ns, file_size):
-        with self._connect() as connection:
-            row = connection.execute(
+        with self._lock:
+            row = self._connection.execute(
                 """
-                SELECT sha256 FROM file_inspection_cache
-                WHERE file_path = ? AND mtime_ns = ? AND file_size = ?
+                SELECT fingerprint, duration, frame_count, fps
+                FROM file_inspection_cache
+                WHERE file_path = ? AND file_size = ? AND mtime_ns = ?
+                    AND deep_scan_status = 'SUCCESS'
                 """,
-                (self._cache_key(file_path), mtime_ns, file_size),
+                (self._cache_key(file_path), file_size, mtime_ns),
             ).fetchone()
-        return row[0] if row else None
+        if row is None:
+            return None
+        return {
+            "fingerprint": row[0],
+            "duration": row[1],
+            "frame_count": row[2],
+            "fps": row[3],
+        }
 
-    def put(self, file_path, mtime_ns, file_size, sha256):
-        with self._connect() as connection:
-            connection.execute(
+    def put(self, file_path, mtime_ns, file_size, record):
+        with self._lock:
+            self._connection.execute(
                 """
-                INSERT OR REPLACE INTO file_inspection_cache
-                    (file_path, mtime_ns, file_size, sha256)
-                VALUES (?, ?, ?, ?)
+                INSERT OR REPLACE INTO file_inspection_cache (
+                    file_path, file_size, mtime_ns, deep_scan_status,
+                    fingerprint, duration, frame_count, fps
+                )
+                VALUES (?, ?, ?, 'SUCCESS', ?, ?, ?, ?)
                 """,
-                (self._cache_key(file_path), mtime_ns, file_size, sha256),
+                (
+                    self._cache_key(file_path),
+                    file_size,
+                    mtime_ns,
+                    record["fingerprint"],
+                    record["duration"],
+                    record["frame_count"],
+                    record["fps"],
+                ),
             )
+            self._connection.commit()
+
+    def close(self):
+        with self._lock:
+            self._connection.close()
+
+
+def _validate_container_header(extension, header, file_size):
+    if extension in (".mp4", ".mov"):
+        marker_offset = header.find(b"ftyp")
+        if marker_offset < 4:
+            return False
+        atom_start = marker_offset - 4
+        atom_size = int.from_bytes(header[atom_start:marker_offset], "big")
+        atom_header_size = 8
+        if atom_size == 1:
+            if marker_offset + 12 > len(header):
+                return False
+            atom_size = int.from_bytes(
+                header[marker_offset + 4:marker_offset + 12], "big"
+            )
+            atom_header_size = 16
+        return (
+            atom_size >= atom_header_size + 8
+            and atom_size <= file_size - atom_start
+        )
+    if extension == ".mkv":
+        return header.startswith(b"\x1a\x45\xdf\xa3")
+    if extension == ".avi":
+        if len(header) < 12 or header[:4] != b"RIFF":
+            return False
+        riff_size = int.from_bytes(header[4:8], "little")
+        return header[8:12] in (b"AVI ", b"AVIX") and 4 <= riff_size <= file_size - 8
+    if extension == ".wmv":
+        return header.startswith(
+            b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c"
+        )
+    return False
+
+
+def _read_fingerprint_region(source_file, start, length, digest, markers=None):
+    source_file.seek(start)
+    remaining = length
+    overlap = b""
+    found_markers = set()
+    marker_values = tuple(markers or ())
+    while remaining:
+        chunk = source_file.read(min(FileInspectionCache.CHUNK_SIZE, remaining))
+        if not chunk:
+            raise OSError("Unexpected end of file during content inspection.")
+        digest.update(chunk)
+        if marker_values:
+            sample = overlap + chunk
+            for marker in marker_values:
+                if marker in sample:
+                    found_markers.add(marker)
+            overlap = sample[-(max(map(len, marker_values)) - 1):]
+            del sample
+        remaining -= len(chunk)
+        del chunk
+    return found_markers
 
 
 def inspect_video_file(file_path, cache):
-    """Hash a source in bounded chunks and verify that OpenCV can decode a frame."""
+    """Inspect container edges and sampled frames without reading full media."""
     initial_stat = os.stat(file_path)
     mtime_ns = initial_stat.st_mtime_ns
     file_size = initial_stat.st_size
-    cached_hash = cache.get(file_path, mtime_ns, file_size)
-    if cached_hash is None:
-        digest = hashlib.sha256()
-        with open(file_path, "rb") as source_file:
-            while True:
-                chunk = source_file.read(FileInspectionCache.CHUNK_SIZE)
-                if not chunk:
-                    break
-                digest.update(chunk)
-        sha256 = digest.hexdigest()
-        current_stat = os.stat(file_path)
-        if (
-            current_stat.st_mtime_ns != mtime_ns
-            or current_stat.st_size != file_size
-        ):
-            raise OSError("File changed during content inspection.")
-        cache.put(file_path, mtime_ns, file_size, sha256)
-        status = "SUCCESS"
-    else:
-        sha256 = cached_hash
-        status = "SKIPPED_CACHE"
+    cached_record = cache.get(file_path, mtime_ns, file_size)
+    if cached_record is not None:
+        return {
+            "path": file_path,
+            "status": "SKIPPED_CACHE",
+            "fingerprint": cached_record["fingerprint"],
+            "duration": cached_record["duration"],
+            "frame_count": cached_record["frame_count"],
+            "fps": cached_record["fps"],
+        }
+
+    extension = os.path.splitext(file_path)[1].casefold()
+    digest = hashlib.sha256()
+    digest.update(file_size.to_bytes(8, "big", signed=False))
+    markers = (
+        (b"moov", b"mdat", b"moof", b"sidx")
+        if extension in (".mp4", ".mov")
+        else ()
+    )
+    with open(file_path, "rb") as source_file:
+        header = source_file.read(min(FileInspectionCache.CHUNK_SIZE, file_size))
+        if not _validate_container_header(extension, header, file_size):
+            raise ValueError(f"Unreadable {extension or 'media'} container header.")
+        del header
+
+        header_length = min(10 * 1024 * 1024, file_size)
+        found_markers = _read_fingerprint_region(
+            source_file, 0, header_length, digest, markers
+        )
+        footer_start = max(header_length, file_size - 5 * 1024 * 1024)
+        if footer_start < file_size:
+            found_markers.update(
+                _read_fingerprint_region(
+                    source_file,
+                    footer_start,
+                    file_size - footer_start,
+                    digest,
+                    markers,
+                )
+            )
+
+    if markers and not found_markers:
+        raise ValueError("MP4/MOV index or media atoms were not found in sampled regions.")
 
     capture = cv2.VideoCapture(file_path)
     try:
@@ -1414,15 +1523,15 @@ def inspect_video_file(file_path, cache):
         frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
         if not capture.isOpened() or fps <= 0 or frame_count <= 0:
             raise ValueError("Video metadata or stream structure is unreadable.")
-        readable, frame = capture.read()
-        if not readable or frame is None:
-            for frame_index in sorted({frame_count // 2, frame_count - 1}):
-                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-                readable, frame = capture.read()
-                if readable and frame is not None:
-                    break
-        if not readable or frame is None:
-            raise ValueError("No sampled video frame could be decoded.")
+        frame_indices = sorted({0, frame_count // 2, frame_count - 1})
+        for frame_index in frame_indices:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            readable, frame = capture.read()
+            if not readable or frame is None:
+                raise ValueError(
+                    f"Video frame {frame_index} could not be decoded."
+                )
+            del frame
     finally:
         capture.release()
 
@@ -1433,72 +1542,78 @@ def inspect_video_file(file_path, cache):
     ):
         raise OSError("File changed during content inspection.")
 
-    return {
+    record = {
         "path": file_path,
-        "status": status,
-        "sha256": sha256,
+        "status": "SUCCESS",
+        "fingerprint": digest.hexdigest(),
         "duration": frame_count / fps,
         "frame_count": frame_count,
         "fps": fps,
     }
+    cache.put(
+        file_path,
+        mtime_ns,
+        file_size,
+        {
+            "fingerprint": record["fingerprint"],
+            "duration": record["duration"],
+            "frame_count": frame_count,
+            "fps": fps,
+        },
+    )
+    return record
 
 
 class FileWorkerPoolController:
-    """Run bounded file tasks with producer-consumer queues and per-file errors."""
+    """Process a lazy path stream with a bounded number of worker futures."""
 
     def __init__(self):
-        self.max_workers = max(1, min(os.cpu_count() or 1, 4))
+        self.max_workers = max(1, min(os.cpu_count() or 1, 2))
 
     def process(self, file_paths, worker, progress_callback=None):
-        if not file_paths:
-            return []
+        file_iterator = iter(file_paths)
+        total = len(file_paths) if hasattr(file_paths, "__len__") else None
+        completed_count = 0
 
-        tasks = queue.Queue()
-        results = queue.Queue()
-        for file_path in file_paths:
-            tasks.put(file_path)
-        for _ in range(self.max_workers):
-            tasks.put(None)
+        def inspect_one(file_path):
+            try:
+                result = worker(file_path)
+                if not isinstance(result, dict):
+                    raise TypeError("File worker must return a result dictionary.")
+                result = dict(result)
+                result.setdefault("path", file_path)
+                return result
+            except Exception as error:
+                return {
+                    "path": file_path,
+                    "status": "FAILED",
+                    "error": str(error),
+                }
 
-        def consume_tasks():
-            while True:
-                file_path = tasks.get()
-                if file_path is None:
-                    tasks.task_done()
-                    return
-                try:
-                    result = worker(file_path)
-                    if not isinstance(result, dict):
-                        raise TypeError("File worker must return a result dictionary.")
-                    result = dict(result)
-                    result.setdefault("path", file_path)
-                except Exception as error:
-                    result = {
-                        "path": file_path,
-                        "status": "FAILED",
-                        "error": str(error),
-                    }
-                finally:
-                    tasks.task_done()
-                results.put(result)
-
-        completed_results = []
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            worker_futures = [
-                executor.submit(consume_tasks)
-                for _ in range(self.max_workers)
-            ]
-            for completed_count in range(1, len(file_paths) + 1):
-                result = results.get()
-                completed_results.append(result)
-                if progress_callback:
-                    progress_callback(
-                        completed_count, len(file_paths), result
-                    )
-            for future in worker_futures:
-                future.result()
+            pending = {}
+            for _ in range(self.max_workers):
+                try:
+                    file_path = next(file_iterator)
+                except StopIteration:
+                    break
+                pending[executor.submit(inspect_one, file_path)] = file_path
 
-        return completed_results
+            while pending:
+                completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in completed:
+                    file_path = pending.pop(future)
+                    result = future.result()
+                    completed_count += 1
+                    if progress_callback:
+                        progress_callback(completed_count, total, result)
+                    yield result
+
+                    try:
+                        next_path = next(file_iterator)
+                    except StopIteration:
+                        continue
+                    pending[executor.submit(inspect_one, next_path)] = next_path
 
 
 # ==============================================================================
@@ -1510,6 +1625,8 @@ class VideoProcessingWorker(QThread):
     progress_signal = pyqtSignal(int)
     finished_signal = pyqtSignal(str, list, str, dict)
     error_signal = pyqtSignal(str)
+    cancelled_signal = pyqtSignal()
+    qc_decision_signal = pyqtSignal(dict)
 
     def __init__(self, raw_folder, sound_path, ref_path, output_folder, max_duration, 
                  is_full_sound, target_width, target_height, enable_stabilizer,
@@ -1532,6 +1649,23 @@ class VideoProcessingWorker(QThread):
         self.scan_all_videos = scan_all_videos
         self.memory_engine = memory_engine
         self.prompt_override = prompt_override
+        self._qc_decision_event = threading.Event()
+        self._qc_decision = None
+
+    def submit_qc_decision(self, decision):
+        if decision not in ("cancel", "regenerate_all", "generate_scenes"):
+            raise ValueError(f"Unknown QC decision: {decision}")
+        self._qc_decision = decision
+        self._qc_decision_event.set()
+
+    def wait_for_qc_decision(self, quality_report):
+        self._qc_decision = None
+        self._qc_decision_event.clear()
+        self.qc_decision_signal.emit(quality_report)
+        self._qc_decision_event.wait()
+        decision = self._qc_decision
+        self._qc_decision = None
+        return decision
 
     def run(self):
         try:
@@ -1540,62 +1674,69 @@ class VideoProcessingWorker(QThread):
 
             # Step 1: Scan Seluruh File Video Bahan di Folder
             self.log_signal.emit(f"📂 Memindai seluruh folder video bahan: {self.raw_folder}")
-            valid_extensions = ('.mp4', '.mov', '.avi', '.mkv')
+            valid_extensions = ('.mp4', '.mov', '.avi', '.mkv', '.wmv')
             scanner = FileScannerEngine(valid_extensions)
-            video_files, filtered_files = scanner.scan(self.raw_folder)
-            if filtered_files:
-                self.log_signal.emit(
-                    f"⏭️ {len(filtered_files)} video dilewati oleh filter "
-                    "direktori/pola pengecualian."
-                )
-
-            if not video_files:
-                self.error_signal.emit("Tidak ada file video valid (.mp4, .mov, .avi, .mkv) di folder bahan!")
-                return
-
             self.log_signal.emit(
-                f"✅ Berhasil menemukan {len(video_files)} kandidat video bahan; "
-                "memulai inspeksi konten paralel."
+                "🔎 Menelusuri sumber secara streaming dan memeriksa konten paralel."
             )
             inspection_cache = FileInspectionCache(
-                self.memory_engine.database_path
+                os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)),
+                    ".file_scan_cache.db",
+                )
             )
             inspection_pool = FileWorkerPoolController()
+            video_files = []
+            cache_hits = 0
+            failed_inspections = 0
 
             def report_inspection_progress(completed, total, result):
-                self.progress_signal.emit(5 + int(10 * completed / total))
+                if total:
+                    progress = 5 + int(10 * completed / total)
+                else:
+                    progress = min(14, 5 + completed)
+                self.progress_signal.emit(progress)
                 if result["status"] == "FAILED":
                     self.log_signal.emit(
                         f"⚠️ Video gagal diinspeksi dan dilewati: "
                         f"{os.path.basename(result['path'])} ({result['error']})"
                     )
 
-            inspection_results = inspection_pool.process(
-                video_files,
-                lambda path: inspect_video_file(path, inspection_cache),
-                report_inspection_progress,
-            )
-            video_files = [
-                result["path"]
-                for result in inspection_results
-                if result["status"] in ("SUCCESS", "SKIPPED_CACHE")
-            ]
+            try:
+                for result in inspection_pool.process(
+                    scanner.iter_files(self.raw_folder),
+                    lambda path: inspect_video_file(path, inspection_cache),
+                    report_inspection_progress,
+                ):
+                    if result["status"] == "SKIPPED_CACHE":
+                        video_files.append(result["path"])
+                        cache_hits += 1
+                    elif result["status"] == "SUCCESS":
+                        video_files.append(result["path"])
+                    elif result["status"] == "FAILED":
+                        failed_inspections += 1
+            finally:
+                inspection_cache.close()
+
             video_files.sort(
                 key=lambda path: os.path.relpath(
                     path, self.raw_folder
                 ).casefold()
             )
-            cache_hits = sum(
-                result["status"] == "SKIPPED_CACHE"
-                for result in inspection_results
-            )
-            failed_inspections = sum(
-                result["status"] == "FAILED"
-                for result in inspection_results
-            )
+            if scanner.skipped_count:
+                self.log_signal.emit(
+                    f"⏭️ {scanner.skipped_count} video dilewati oleh filter "
+                    "direktori/pola pengecualian."
+                )
+            if not video_files and not failed_inspections:
+                self.error_signal.emit(
+                    "Tidak ada file video valid (.mp4, .mov, .avi, .mkv, .wmv) "
+                    "di folder bahan!"
+                )
+                return
             self.log_signal.emit(
                 f"✅ Inspeksi selesai: {len(video_files)} valid, "
-                f"{cache_hits} hash dari cache, {failed_inspections} gagal."
+                f"{cache_hits} inspeksi dari cache, {failed_inspections} gagal."
             )
             if not video_files:
                 self.error_signal.emit(
@@ -2035,8 +2176,10 @@ class VideoProcessingWorker(QThread):
             preview_output_path = ""
             scene_metadata = []
             quality_report = {}
+            attempt = 0
+            automatic_retries = 0
 
-            for attempt in range(max_qc_retries + 1):
+            while True:
                 scene_metadata = []
                 timeline_position = 0.0
                 for scene_index, cut in enumerate(selected_cuts):
@@ -2293,30 +2436,56 @@ class VideoProcessingWorker(QThread):
                         "ditahan agar hasil yang belum terverifikasi tidak digunakan."
                     )
                     return
-                if attempt == max_qc_retries:
-                    break
+
+                if automatic_retries < max_qc_retries:
+                    replacement_cuts = replace_problem_scenes(
+                        selected_cuts,
+                        ranked_scenes,
+                        quality_report["findings"],
+                        excluded_scenes,
+                    )
+                    if replacement_cuts is not None:
+                        selected_cuts = replacement_cuts
+                        automatic_retries += 1
+                        attempt += 1
+                        continue
+
+                self.log_signal.emit(
+                    "QC belum lulus setelah percobaan otomatis. Menunggu keputusan "
+                    "untuk membatalkan, membuat ulang seluruh video, atau mengganti "
+                    "adegan bermasalah."
+                )
+                decision = self.wait_for_qc_decision(quality_report)
+                if decision == "cancel":
+                    self.log_signal.emit("Proses dibatalkan setelah QC tidak lulus.")
+                    self.cancelled_signal.emit()
+                    return
 
                 replacement_cuts = replace_problem_scenes(
                     selected_cuts,
                     ranked_scenes,
                     quality_report["findings"],
                     excluded_scenes,
+                    replace_all=decision == "regenerate_all",
                 )
                 if replacement_cuts is None:
-                    break
+                    if decision == "regenerate_all":
+                        replacement_cuts = [
+                            dict(cut) for cut in selected_cuts
+                        ]
+                        self.log_signal.emit(
+                            "Tidak ada kombinasi adegan baru yang tersedia; "
+                            "seluruh video akan dirender ulang dengan adegan saat ini."
+                        )
+                    else:
+                        self.error_signal.emit(
+                            "Tidak ada adegan alternatif yang tersedia untuk "
+                            "diperbaiki. Tambahkan video sumber lain lalu jalankan ulang."
+                        )
+                        return
                 selected_cuts = replacement_cuts
-
-            if quality_report["status"] != "ok":
-                findings_text = "\n".join(
-                    f"- {finding['message']}"
-                    for finding in quality_report.get("findings", [])[:8]
-                )
-                self.error_signal.emit(
-                    "QC belum lolos setelah mencoba adegan alternatif. Preview dan "
-                    "download ditahan. Periksa file sumber atau jalankan ulang edit."
-                    + (f"\n\n{findings_text}" if findings_text else "")
-                )
-                return
+                automatic_retries = 0
+                attempt += 1
 
             self.progress_signal.emit(100)
             self.log_signal.emit(
@@ -2780,12 +2949,14 @@ class AIStudioPanel(QMainWindow):
         self.worker.progress_signal.connect(self.progress_bar.setValue)
         self.worker.finished_signal.connect(self.on_processing_finished)
         self.worker.error_signal.connect(self.on_processing_error)
+        self.worker.cancelled_signal.connect(self.on_processing_cancelled)
+        self.worker.qc_decision_signal.connect(self.on_qc_decision_requested)
+        self.worker.finished.connect(self.on_worker_thread_finished)
         self.worker.start()
 
     def on_processing_finished(
         self, result_path, scene_metadata, preview_path, quality_report
     ):
-        self.btn_start.setEnabled(True)
         self.last_render_path = result_path
         self.current_scene_metadata = scene_metadata
         self.quality_report_label.setText(
@@ -2796,6 +2967,40 @@ class AIStudioPanel(QMainWindow):
         self.page_stack.setCurrentWidget(self.review_page)
         self.video_player.load_video(preview_path, scene_metadata)
         self.append_log("🎬 Render selesai. Preview dan evaluasi adegan dimulai.")
+
+    def on_qc_decision_requested(self, quality_report):
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setWindowTitle("QC belum lulus")
+        dialog.setText(
+            "Hasil video belum memenuhi pemeriksaan kualitas. Preview dan ekspor "
+            "tetap ditahan sampai render ulang lulus QC.\n\n"
+            + self.format_quality_report(quality_report)
+        )
+        dialog.addButton("Cancel", QMessageBox.RejectRole)
+        regenerate_all_button = dialog.addButton(
+            "generate ulang semua video", QMessageBox.ActionRole
+        )
+        regenerate_scenes_button = dialog.addButton(
+            "generate scene", QMessageBox.ActionRole
+        )
+        dialog.setDefaultButton(regenerate_scenes_button)
+        dialog.exec_()
+
+        if dialog.clickedButton() is regenerate_all_button:
+            decision = "regenerate_all"
+        elif dialog.clickedButton() is regenerate_scenes_button:
+            decision = "generate_scenes"
+        else:
+            decision = "cancel"
+        self.worker.submit_qc_decision(decision)
+
+    def on_processing_cancelled(self):
+        self.page_stack.setCurrentWidget(self.setup_page)
+        self.append_log("Proses dibatalkan; hasil yang gagal QC tidak dapat disimpan.")
+
+    def on_worker_thread_finished(self):
+        self.btn_start.setEnabled(True)
 
     @staticmethod
     def format_quality_report(report):
@@ -2900,7 +3105,6 @@ class AIStudioPanel(QMainWindow):
         self.start_processing(prompt_override)
 
     def on_processing_error(self, error_msg):
-        self.btn_start.setEnabled(True)
         self.page_stack.setCurrentWidget(self.setup_page)
         QMessageBox.critical(self, "Process Error", f"Terjadi kesalahan:\n{error_msg}")
 
