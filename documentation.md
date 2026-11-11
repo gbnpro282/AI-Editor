@@ -12,7 +12,7 @@ AI Local Video Editor Studio Pro is a desktop application for assembling source 
 - Choose clip timing based on the reference video, music beats, or a hybrid of both.
 - Optionally rank clips by scoring a frame from each video with an Ollama vision model.
 - Sample video segments across the full duration of source videos, optionally rank sampled scenes with Ollama, and use their source timestamps instead of always taking the beginning.
-- Speed up sample evaluation by reusing in-memory JPEG frames, a persistent local Ollama connection, cached preference data, and keeping the vision model loaded during scoring; show rolling remaining-time and estimated-finish updates without changing frame coverage or image quality settings.
+- Speed up sample evaluation with bounded background frame prefetch, four-frame 2x2 vision grids, in-memory JPEG encoding, cached preferences, and Ollama model keep-alive; beat analysis runs alongside source scanning and its results are cached by audio-content MD5.
 - Review the rendered video in-app, with playback pausing at every scene boundary for a 1–5 star rating and optional feedback.
 - Create a Windows-compatible WMV preview with the rendered audio, plus Skip-to-completion and Replay controls.
 - Store compact scene ratings and perceptual hashes in `Memory Learning/memory_learning.db`; use prior ratings to personalize later clip scoring.
@@ -25,12 +25,12 @@ AI Local Video Editor Studio Pro is a desktop application for assembling source 
 - Choose a 9:16, 16:9, 1:1, or 4:5 output size.
 - Set a 15-, 30-, or 60-second duration, or use the full soundtrack duration.
 - Keep or mute source-video audio, mix it with an optional soundtrack, and optionally apply FFmpeg's `deshake` filter.
-- Render H.264 video using NVIDIA NVENC at 60 FPS, with AAC audio from the soundtrack or source clips.
+- Render HEVC video using NVIDIA NVENC P7/HQ at 60 FPS with VBR/CQ 18 and AAC audio from the soundtrack or source clips.
 
 ### Requirements
 
 - Windows with Python and the required Python packages installed.
-- FFmpeg available on `PATH`, built with the `h264_nvenc` encoder.
+- FFmpeg available on `PATH`, built with the `hevc_nvenc` encoder.
 - An NVIDIA GPU and compatible driver for NVENC rendering.
 - Ollama running locally with a compatible vision model installed to use AI clip ranking. The default model is `qwen2.5vl:3b`. Ollama-based ranking can be disabled in the application.
 
@@ -44,7 +44,7 @@ The application imports PyQt5, requests, NumPy, OpenCV, librosa, and PySceneDete
    python -m pip install PyQt5 requests numpy opencv-python librosa scenedetect
    ```
 
-2. Install FFmpeg, ensure its `bin` directory is on `PATH`, and verify that the build supports `h264_nvenc`.
+2. Install FFmpeg, ensure its `bin` directory is on `PATH`, and verify that the build supports `hevc_nvenc`.
 3. To enable AI clip ranking, install and start Ollama, then download the default model:
 
    ```powershell
@@ -85,12 +85,12 @@ python AI_Video_Studio_Pro.py
 - Rendering can take substantial time and disk space, especially at 4K. Actual performance depends on the hardware, media, and FFmpeg build.
 - If Ollama is unavailable or a frame cannot be scored, the application may use its built-in default score. Check the application log and terminal output when troubleshooting.
 - Ratings, comments, external prompts, preference summaries, and render quality reports are stored locally in `Memory Learning/memory_learning.db`. Keep this database to preserve learned preferences and past check reports between launches.
-- The `_preview.wmv` file is a playback proxy; the original H.264 MP4 remains the file saved/exported by the completion panel.
+- The `_preview.wmv` file is a playback proxy; the original HEVC MP4 remains the file saved/exported by the completion panel.
 
 ### Troubleshooting
 
 - **FFmpeg not found**: add FFmpeg's `bin` directory to `PATH`, then restart the application.
-- **NVENC encoder error**: verify NVIDIA drivers, GPU support, and that FFmpeg includes `h264_nvenc`.
+- **NVENC encoder error**: verify NVIDIA drivers, GPU support, and that FFmpeg includes `hevc_nvenc`.
 - **Ollama model missing or unavailable**: start Ollama and install a vision model; alternatively disable AI clip ranking.
 - **No source clips detected**: check that the selected folder contains videos with one of the supported extensions.
 - **Invalid input warning**: confirm that all selected paths exist and point to the expected file or folder type.
@@ -118,16 +118,16 @@ AI Local Video Editor Studio Pro adalah aplikasi desktop untuk menyusun klip vid
 - Menyimpan hasil render ke lokasi pilihan atau membuat ulang edit dengan rating tersimpan dan prompt global opsional.
 - Memindai semua video bahan atau membatasi pemindaian AI pada 30 video pertama.
 - Memfilter folder dan pola berkas yang dikecualikan sebelum inspeksi; menelusuri jalur dengan `os.scandir`, memeriksa header dan bagian akhir kontainer dalam blok 64 KiB, serta mendekode frame sampel melalui worker pool dua pekerja. Hasil inspeksi berhasil disimpan di `.file_scan_cache.db` berdasarkan jalur, ukuran, dan waktu modifikasi.
-- Mempercepat evaluasi sampel dengan memakai ulang frame JPEG di memori, koneksi Ollama lokal, data preferensi yang di-cache, dan menjaga model tetap dimuat selama penilaian; menampilkan pembaruan sisa waktu dan perkiraan selesai tanpa mengubah cakupan sampel atau pengaturan kualitas gambar.
+- Mempercepat evaluasi dengan prefetch frame terbatas di latar belakang, grid vision 2x2 yang menilai empat sampel dalam satu request, JPEG di memori, dan model Ollama yang tetap dimuat. Analisis beat berjalan bersamaan dengan pemindaian folder dan di-cache berdasarkan MD5 audio.
 - Memilih ukuran output 9:16, 16:9, 1:1, atau 4:5.
 - Mengatur durasi 15, 30, atau 60 detik, atau mengikuti durasi penuh soundtrack.
 - Mempertahankan atau mematikan audio video bahan, mencampurnya dengan soundtrack opsional, serta mengaktifkan filter `deshake` FFmpeg secara opsional.
-- Merender video H.264 menggunakan NVIDIA NVENC pada 60 FPS, dengan audio AAC dari soundtrack atau video bahan.
+- Merender video HEVC menggunakan NVIDIA NVENC P7/HQ pada 60 FPS dengan VBR/CQ 18, serta audio AAC dari soundtrack atau video bahan.
 
 ### Persyaratan
 
 - Windows dengan Python dan paket Python yang diperlukan.
-- FFmpeg tersedia melalui `PATH` dan dibangun dengan encoder `h264_nvenc`.
+- FFmpeg tersedia melalui `PATH` dan dibangun dengan encoder `hevc_nvenc`.
 - GPU NVIDIA dan driver yang kompatibel untuk rendering NVENC.
 - Ollama yang berjalan secara lokal dan model vision yang sudah terpasang untuk menggunakan pemeringkatan klip AI. Model bawaan adalah `qwen2.5vl:3b`. Pemeringkatan melalui Ollama dapat dinonaktifkan di aplikasi.
 
@@ -141,7 +141,7 @@ Aplikasi mengimpor PyQt5, requests, NumPy, OpenCV, librosa, dan PySceneDetect.
    python -m pip install PyQt5 requests numpy opencv-python librosa scenedetect
    ```
 
-2. Pasang FFmpeg, tambahkan direktori `bin` ke `PATH`, dan pastikan build FFmpeg mendukung `h264_nvenc`.
+2. Pasang FFmpeg, tambahkan direktori `bin` ke `PATH`, dan pastikan build FFmpeg mendukung `hevc_nvenc`.
 3. Untuk menggunakan pemeringkatan klip AI, pasang dan jalankan Ollama, lalu unduh model bawaan:
 
    ```powershell
@@ -182,12 +182,12 @@ python AI_Video_Studio_Pro.py
 - Rendering dapat membutuhkan waktu dan ruang disk yang cukup besar, terutama pada resolusi 4K. Performa aktual bergantung pada perangkat keras, media, dan build FFmpeg.
 - Jika Ollama tidak tersedia atau frame tidak dapat dinilai, aplikasi mungkin menggunakan skor bawaan. Periksa log aplikasi dan keluaran terminal saat melakukan pemecahan masalah.
 - Rating, komentar, prompt eksternal, ringkasan preferensi, dan laporan kualitas render disimpan lokal di `Memory Learning/memory_learning.db`. Pertahankan database ini agar preferensi dan laporan pemeriksaan sebelumnya tetap tersedia setelah aplikasi ditutup.
-- File `_preview.wmv` hanya proxy untuk playback; file MP4 H.264 asli tetap menjadi file yang disimpan/diekspor dari panel akhir.
+- File `_preview.wmv` hanya proxy untuk playback; file MP4 HEVC asli tetap menjadi file yang disimpan/diekspor dari panel akhir.
 
 ### Pemecahan masalah
 
 - **FFmpeg tidak ditemukan**: tambahkan direktori `bin` FFmpeg ke `PATH`, lalu mulai ulang aplikasi.
-- **Kesalahan encoder NVENC**: periksa driver NVIDIA, dukungan GPU, dan pastikan FFmpeg menyertakan `h264_nvenc`.
+- **Kesalahan encoder NVENC**: periksa driver NVIDIA, dukungan GPU, dan pastikan FFmpeg menyertakan `hevc_nvenc`.
 - **Model Ollama tidak tersedia**: jalankan Ollama dan pasang model vision; atau nonaktifkan pemeringkatan klip AI.
 - **Video bahan tidak terdeteksi**: pastikan folder yang dipilih berisi video dengan ekstensi yang didukung.
 - **Peringatan input tidak valid**: pastikan semua path yang dipilih ada dan menunjuk ke jenis file atau folder yang benar.

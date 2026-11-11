@@ -10,6 +10,7 @@ import sqlite3
 import time
 import subprocess
 import base64
+import queue
 import threading
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from collections import Counter
@@ -62,7 +63,7 @@ from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtMultimediaWidgets import QVideoWidget
 
 # PySceneDetect Engine
-from scenedetect import detect, ContentDetector
+from scenedetect import ContentDetector, SceneManager, open_video
 
 OLLAMA_API_URL = "http://localhost:11434/api/generate"
 DEFAULT_VISION_MODEL = "qwen2.5vl:3b"
@@ -73,6 +74,37 @@ def format_elapsed_time(seconds):
     hours, remainder = divmod(total_seconds, 3600)
     minutes, seconds = divmod(remainder, 60)
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def create_2x2_grid(frames, output_size=768):
+    """Create an aspect-preserving chronological 2x2 image for vision scoring."""
+    if len(frames) != 4:
+        raise ValueError("A 2x2 vision grid requires exactly four frames.")
+    if output_size <= 0 or output_size % 2:
+        raise ValueError("The vision grid size must be a positive even number.")
+
+    tile_size = output_size // 2
+    grid = np.zeros((output_size, output_size, 3), dtype=np.uint8)
+    for index, frame in enumerate(frames):
+        if frame is None or frame.size == 0:
+            raise ValueError(f"Vision grid frame {index + 1} is empty.")
+        if frame.ndim == 2:
+            frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        height, width = frame.shape[:2]
+        scale = min(tile_size / width, tile_size / height)
+        resized_width = max(1, round(width * scale))
+        resized_height = max(1, round(height * scale))
+        interpolation = (
+            cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+        )
+        resized = cv2.resize(
+            frame, (resized_width, resized_height), interpolation=interpolation
+        )
+        row, column = divmod(index, 2)
+        x = column * tile_size + (tile_size - resized_width) // 2
+        y = row * tile_size + (tile_size - resized_height) // 2
+        grid[y:y + resized_height, x:x + resized_width] = resized
+    return grid
 
 
 def check_render_quality(
@@ -568,7 +600,8 @@ class OllamaAIAnalyst:
     @staticmethod
     def score_video_clip_with_memory(
         model_name, image_path, memory_engine, prompt_criteria="sinematik, pencahayaan bagus, aksi tajam",
-        prompt_override="", image_bytes=None, examples=None, memory_profile=None
+        prompt_override="", image_bytes=None, examples=None, memory_profile=None,
+        sample_count=1,
     ):
         if examples is None:
             examples = memory_engine.get_few_shot_examples(limit=5)
@@ -610,24 +643,60 @@ class OllamaAIAnalyst:
                 + prompt_override.strip()
             )
         return OllamaAIAnalyst._score_video_clip(
-            model_name, image_path, prompt_criteria, memory_context, image_bytes
+            model_name,
+            image_path,
+            prompt_criteria,
+            memory_context,
+            image_bytes,
+            sample_count,
         )
 
     @staticmethod
     def _score_video_clip(
-        model_name, image_path, prompt_criteria, system_context, image_bytes=None
+        model_name, image_path, prompt_criteria, system_context, image_bytes=None,
+        sample_count=1,
     ):
         try:
+            sample_count = max(1, int(sample_count))
             if image_bytes is None:
                 with open(image_path, "rb") as f:
                     image_bytes = f.read()
             img_b64 = base64.b64encode(image_bytes).decode('utf-8')
 
             prompt = (
-                f"Analisis foto ini berdasarkan kriteria: {prompt_criteria}.\n"
-                "Berikan penilaian estetika dan kejelasan aksi dari skala 1 sampai 10.\n"
-                "Jawab HANYA angka skor bulatnya saja tanpa teks tambahan (contoh: 8)."
+                "Analisis grid 2x2 yang berisi frame sampel kronologis dari satu "
+                "video sumber (kiri atas ke kanan bawah). Nilai komposisi, "
+                "pencahayaan, fokus subjek, dan gerakan visual berdasarkan "
+                f"kriteria berikut: {prompt_criteria}.\n"
+                "Berikan hanya objek JSON dengan rating keseluruhan 1-5, "
+                "lighting_score 1-5, action_score 1-5, dan notes singkat."
             )
+
+            properties = {
+                "rating": {"type": "integer", "minimum": 1, "maximum": 5},
+                "lighting_score": {
+                    "type": "integer", "minimum": 1, "maximum": 5
+                },
+                "action_score": {
+                    "type": "integer", "minimum": 1, "maximum": 5
+                },
+                "notes": {"type": "string"},
+            }
+            required = ["rating", "lighting_score", "action_score", "notes"]
+            if sample_count > 1:
+                prompt += (
+                    f" Tambahkan ratings berupa tepat {sample_count} skor "
+                    "1-5, satu untuk tiap sampel unik dengan urutan kiri atas, "
+                    "kanan atas, kiri bawah, kanan bawah; abaikan sel duplikat "
+                    "yang digunakan sebagai padding."
+                )
+                properties["ratings"] = {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "minItems": sample_count,
+                    "maxItems": sample_count,
+                }
+                required.append("ratings")
 
             payload = {
                 "model": model_name,
@@ -635,10 +704,20 @@ class OllamaAIAnalyst:
                 "prompt": prompt,
                 "images": [img_b64],
                 "stream": False,
-                "keep_alive": "10m",
+                "format": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": properties,
+                    "required": required,
+                },
+                "keep_alive": -1,
                 "options": {
                     "temperature": 0.2,
-                    "num_predict": 10
+                    "num_predict": 128,
+                    "num_gpu": 99,
+                    "num_thread": 8,
+                    "top_k": 20,
+                    "top_p": 0.9,
                 }
             }
             
@@ -646,14 +725,34 @@ class OllamaAIAnalyst:
                 OLLAMA_API_URL, json=payload, timeout=12
             )
             if res.status_code == 200:
-                response_text = res.json().get("response", "7").strip()
-                digits = [int(s) for s in response_text.split() if s.isdigit()]
-                if digits:
-                    score = digits[0]
-                    return max(1, min(10, score))
+                response_text = res.json().get("response", "")
+                result = json.loads(response_text)
+                rating = result["rating"]
+                if isinstance(rating, bool) or not isinstance(rating, int):
+                    raise ValueError("Ollama returned a non-integer rating.")
+                if not 1 <= rating <= 5:
+                    raise ValueError("Ollama rating must be between 1 and 5.")
+                if sample_count > 1:
+                    ratings = result["ratings"]
+                    if (
+                        not isinstance(ratings, list)
+                        or len(ratings) != sample_count
+                        or any(
+                            isinstance(value, bool)
+                            or not isinstance(value, int)
+                            or not 1 <= value <= 5
+                            for value in ratings
+                        )
+                    ):
+                        raise ValueError(
+                            "Ollama returned invalid per-frame ratings."
+                        )
+                    return [value * 2 for value in ratings]
+                return rating * 2
+            res.raise_for_status()
         except Exception as e:
             print(f"[Ollama Vision Scoring Error] {e}")
-        return 7
+        return [7] * sample_count if sample_count > 1 else 7
 
 
 class MemoryLearningEngine:
@@ -1182,16 +1281,64 @@ class AudioBeatAnalyzer:
     def __init__(self, audio_path):
         self.audio_path = audio_path
 
+    def _cache_path(self):
+        digest = hashlib.md5()
+        with open(self.audio_path, "rb") as audio_file:
+            for chunk in iter(lambda: audio_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        cache_directory = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "Memory Learning",
+            "audio_beat_cache",
+        )
+        os.makedirs(cache_directory, exist_ok=True)
+        return os.path.join(cache_directory, f"{digest.hexdigest()}.json")
+
     def get_audio_info(self):
         try:
-            y, sr = librosa.load(self.audio_path, sr=None)
+            cache_path = self._cache_path()
+            try:
+                with open(cache_path, "r", encoding="utf-8") as cache_file:
+                    cached = json.load(cache_file)
+                if (
+                    isinstance(cached, dict)
+                    and isinstance(cached.get("tempo"), (int, float))
+                    and isinstance(cached.get("beats"), list)
+                    and isinstance(cached.get("duration"), (int, float))
+                ):
+                    return (
+                        float(cached["tempo"]),
+                        [float(beat) for beat in cached["beats"]],
+                        float(cached["duration"]),
+                    )
+            except FileNotFoundError:
+                pass
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+                print(f"[AudioAnalyzer Cache Warning] {error}")
+
+            y, sr = librosa.load(self.audio_path, sr=22050, mono=True)
             full_duration = float(librosa.get_duration(y=y, sr=sr))
             tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
             beat_times = librosa.frames_to_time(beat_frames, sr=sr)
             
             tempo_float = float(np.mean(tempo))
             beat_list = [float(b) for b in beat_times]
-            
+
+            try:
+                temporary_path = f"{cache_path}.{os.getpid()}.tmp"
+                with open(temporary_path, "w", encoding="utf-8") as cache_file:
+                    json.dump(
+                        {
+                            "tempo": tempo_float,
+                            "beats": beat_list,
+                            "duration": full_duration,
+                        },
+                        cache_file,
+                    )
+                os.replace(temporary_path, cache_path)
+            except OSError as error:
+                print(f"[AudioAnalyzer Cache Warning] {error}")
+
             return tempo_float, beat_list, full_duration
         except Exception as e:
             print(f"[AudioAnalyzer Error] {e}")
@@ -1214,7 +1361,16 @@ class ReferenceStyleAnalyzer:
             "fps": 60.0
         }
         try:
-            scene_list = detect(self.ref_video_path, ContentDetector(threshold=27.0))
+            video = open_video(self.ref_video_path)
+            try:
+                scene_manager = SceneManager()
+                scene_manager.auto_downscale = False
+                scene_manager.downscale = 4
+                scene_manager.add_detector(ContentDetector(threshold=27.0))
+                scene_manager.detect_scenes(video=video, frame_skip=2)
+                scene_list = scene_manager.get_scene_list()
+            finally:
+                video.capture.release()
             cuts = [float(scene[0].seconds) for scene in scene_list]
             analysis_data["scene_cuts"] = cuts
             
@@ -1671,6 +1827,22 @@ class VideoProcessingWorker(QThread):
         try:
             self.log_signal.emit("🚀 Memulai Autopilot AI Video Editing Pipeline...")
             self.progress_signal.emit(5)
+            audio_results = queue.Queue(maxsize=1)
+            if self.sound_path:
+                def analyze_audio_in_background():
+                    try:
+                        result = AudioBeatAnalyzer(
+                            self.sound_path
+                        ).get_audio_info()
+                        audio_results.put((True, result))
+                    except Exception as error:
+                        audio_results.put((False, error))
+
+                threading.Thread(
+                    target=analyze_audio_in_background,
+                    name="audio-beat-analysis",
+                    daemon=True,
+                ).start()
 
             # Step 1: Scan Seluruh File Video Bahan di Folder
             self.log_signal.emit(f"📂 Memindai seluruh folder video bahan: {self.raw_folder}")
@@ -1750,8 +1922,15 @@ class VideoProcessingWorker(QThread):
             # Step 2: Analyze optional soundtrack.
             if self.sound_path:
                 self.log_signal.emit("🎵 Menganalisis ritme, tempo, & beat musik audio...")
-                beat_analyzer = AudioBeatAnalyzer(self.sound_path)
-                tempo, beats, audio_total_duration = beat_analyzer.get_audio_info()
+                audio_succeeded, audio_result = audio_results.get()
+                if audio_succeeded:
+                    tempo, beats, audio_total_duration = audio_result
+                else:
+                    self.log_signal.emit(
+                        f"⚠️ Analisis audio gagal; menggunakan timing default: "
+                        f"{audio_result}"
+                    )
+                    tempo, beats, audio_total_duration = 120.0, [], 30.0
                 target_duration = (
                     audio_total_duration
                     if self.is_full_sound
@@ -1990,20 +2169,17 @@ class VideoProcessingWorker(QThread):
                     "🎞️ Mengambil sampel acak-tersebar dari awal hingga akhir setiap video..."
                 )
 
-            for file_index, video_path in enumerate(video_files):
+            def extract_video_samples(file_index, video_path):
                 capture = cv2.VideoCapture(video_path)
-                starts = []
                 try:
                     fps = float(capture.get(cv2.CAP_PROP_FPS))
                     frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
                     if not capture.isOpened() or fps <= 0 or frame_count <= 0:
-                        self.log_signal.emit(
-                            f"⚠️ Video dilewati karena durasi/frame tidak dapat dibaca: "
-                            f"{os.path.basename(video_path)}"
-                        )
-                        scan_expected_samples -= candidate_count
-                        report_scan_progress(file_index, video_path)
-                        continue
+                        return {
+                            "error": "Durasi/frame tidak dapat dibaca.",
+                            "starts": [],
+                            "samples": [],
+                        }
 
                     source_duration = frame_count / fps
                     starts = build_temporal_sample_starts(
@@ -2012,23 +2188,238 @@ class VideoProcessingWorker(QThread):
                         candidate_count,
                         sample_rng,
                     )
-                    scan_expected_samples += len(starts) - candidate_count
+                    samples = []
                     for sample_index, start in enumerate(starts, start=1):
-                        sample_started_at = time.perf_counter()
-                        sample_time = min(
+                        sample_duration = min(
+                            probe_duration, source_duration - start
+                        )
+                        if sample_duration <= 0:
+                            samples.append(
+                                {
+                                    "start": start,
+                                    "error": "Durasi sampel kosong.",
+                                }
+                            )
+                            continue
+
+                        center_time = min(
                             source_duration - 1.0 / fps,
-                            start
-                            + min(probe_duration, source_duration - start) / 2.0,
+                            start + sample_duration / 2.0,
                         )
-                        frame_index = max(
-                            0, min(frame_count - 1, int(sample_time * fps))
+                        center_index = max(
+                            0, min(frame_count - 1, int(center_time * fps))
                         )
-                        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-                        ret, frame = capture.read()
-                        if not ret:
+                        capture.set(cv2.CAP_PROP_POS_FRAMES, center_index)
+                        readable, frame = capture.read()
+                        if not readable or frame is None:
+                            samples.append(
+                                {
+                                    "start": start,
+                                    "error": (
+                                        f"Frame tengah sampel {sample_index} "
+                                        "tidak dapat dibaca."
+                                    ),
+                                }
+                            )
+                            continue
+
+                        encoded, encoded_frame = cv2.imencode(
+                            ".jpg",
+                            frame,
+                            [cv2.IMWRITE_JPEG_QUALITY, 95],
+                        )
+                        if not encoded:
+                            samples.append(
+                                {
+                                    "start": start,
+                                    "error": (
+                                        f"Frame sampel {sample_index} "
+                                        "tidak dapat dienkode."
+                                    ),
+                                }
+                            )
+                            continue
+
+                        image_bytes = encoded_frame.tobytes()
+                        frame_hash = MemoryLearningEngine.perceptual_hash(
+                            image_bytes
+                        )
+                        samples.append(
+                            {
+                                "start": start,
+                                "frame_hash": frame_hash,
+                                "image_bytes": image_bytes,
+                            }
+                        )
+
+                    return {
+                        "error": None,
+                        "starts": starts,
+                        "samples": samples,
+                        "source_duration": source_duration,
+                        "file_index": file_index,
+                    }
+                finally:
+                    capture.release()
+
+            with ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="frame-sampler"
+            ) as sampler_pool:
+                pending_samples = {}
+                next_file_index = 0
+                while next_file_index < min(2, len(video_files)):
+                    path = video_files[next_file_index]
+                    pending_samples[next_file_index] = sampler_pool.submit(
+                        extract_video_samples, next_file_index, path
+                    )
+                    next_file_index += 1
+
+                for file_index, video_path in enumerate(video_files):
+                    extraction_started_at = time.perf_counter()
+                    try:
+                        extracted = pending_samples.pop(file_index).result()
+                    except Exception as error:
+                        self.log_signal.emit(
+                            f"⚠️ Ekstraksi sampel gagal untuk "
+                            f"{os.path.basename(video_path)}; skor fallback "
+                            f"akan digunakan: {error}"
+                        )
+                        completed_samples += candidate_count
+                        report_scan_progress(file_index, video_path)
+                        extracted = None
+
+                    if next_file_index < len(video_files):
+                        path = video_files[next_file_index]
+                        pending_samples[next_file_index] = sampler_pool.submit(
+                            extract_video_samples, next_file_index, path
+                        )
+                        next_file_index += 1
+
+                    if extracted is None:
+                        continue
+                    starts = extracted["starts"]
+                    scan_expected_samples += len(starts) - candidate_count
+                    if extracted["error"]:
+                        self.log_signal.emit(
+                            f"⚠️ Video dilewati karena durasi/frame tidak dapat "
+                            f"dibaca: {os.path.basename(video_path)} "
+                            f"({extracted['error']})"
+                        )
+                        completed_samples += candidate_count
+                        report_scan_progress(file_index, video_path)
+                        continue
+
+                    source_duration = extracted["source_duration"]
+                    samples = extracted["samples"]
+                    sample_scores = [7] * len(samples)
+                    sample_elapsed_times = [0.0] * len(samples)
+                    if samples:
+                        extraction_elapsed = (
+                            time.perf_counter() - extraction_started_at
+                        ) / len(samples)
+                        sample_elapsed_times = [
+                            extraction_elapsed
+                        ] * len(samples)
+                    if should_use_ollama and video_path in sample_video_set:
+                        valid_sample_indices = [
+                            index
+                            for index, sample in enumerate(samples)
+                            if "error" not in sample
+                        ]
+                        for batch_start in range(
+                            0, len(valid_sample_indices), 4
+                        ):
+                            batch_indices = valid_sample_indices[
+                                batch_start:batch_start + 4
+                            ]
+                            batch_frames = []
+                            batch_started_at = time.perf_counter()
+                            try:
+                                for sample_index in batch_indices:
+                                    image = cv2.imdecode(
+                                        np.frombuffer(
+                                            samples[sample_index]["image_bytes"],
+                                            dtype=np.uint8,
+                                        ),
+                                        cv2.IMREAD_COLOR,
+                                    )
+                                    if image is None:
+                                        raise ValueError(
+                                            "JPEG sampel tidak dapat dibaca."
+                                        )
+                                    batch_frames.append(image)
+                                while len(batch_frames) < 4:
+                                    batch_frames.append(batch_frames[-1])
+
+                                grid = create_2x2_grid(batch_frames)
+                                grid_encoded, encoded_grid = cv2.imencode(
+                                    ".jpg",
+                                    grid,
+                                    [cv2.IMWRITE_JPEG_QUALITY, 95],
+                                )
+                                if not grid_encoded:
+                                    raise OSError(
+                                        "Grid 2x2 tidak dapat dienkode."
+                                    )
+                                batch_scores = (
+                                    OllamaAIAnalyst.score_video_clip_with_memory(
+                                        self.ollama_model,
+                                        None,
+                                        self.memory_engine,
+                                        prompt_override=self.prompt_override,
+                                        image_bytes=encoded_grid.tobytes(),
+                                        examples=memory_examples,
+                                        memory_profile=memory_profile,
+                                        sample_count=len(batch_indices),
+                                    )
+                                )
+                                if (
+                                    not isinstance(batch_scores, list)
+                                    or len(batch_scores) != len(batch_indices)
+                                ):
+                                    if (
+                                        len(batch_indices) == 1
+                                        and isinstance(batch_scores, int)
+                                    ):
+                                        batch_scores = [batch_scores]
+                                    else:
+                                        raise ValueError(
+                                            "Jumlah rating Ollama tidak cocok "
+                                            "dengan jumlah sampel."
+                                        )
+                                for sample_index, score in zip(
+                                    batch_indices, batch_scores
+                                ):
+                                    sample_scores[sample_index] = score
+                            except Exception as error:
+                                self.log_signal.emit(
+                                    f"⚠️ Penilaian grid gagal untuk "
+                                    f"{os.path.basename(video_path)}; "
+                                    f"{len(batch_indices)} sampel memakai "
+                                    f"skor fallback 7/10: {error}"
+                                )
+                            batch_elapsed = (
+                                time.perf_counter() - batch_started_at
+                            ) / len(batch_indices)
+                            for sample_index in batch_indices:
+                                sample_elapsed_times[sample_index] += (
+                                    batch_elapsed
+                                )
+
+                    for sample_index, sample in enumerate(
+                        samples, start=1
+                    ):
+                        sample_started_at = time.perf_counter()
+                        if "error" in sample:
+                            self.log_signal.emit(
+                                f"⚠️ Sampel {sample_index} pada "
+                                f"{os.path.basename(video_path)} gagal: "
+                                f"{sample['error']}"
+                            )
                             completed_samples += 1
                             recent_sample_durations.append(
-                                time.perf_counter() - sample_started_at
+                                sample_elapsed_times[sample_index - 1]
+                                + time.perf_counter() - sample_started_at
                             )
                             del recent_sample_durations[:-20]
                             report_scan_progress(
@@ -2036,24 +2427,8 @@ class VideoProcessingWorker(QThread):
                             )
                             continue
 
-                        encoded, encoded_frame = cv2.imencode(".jpg", frame)
-                        if not encoded:
-                            raise OSError(
-                                "Gagal mengenkode frame sementara untuk evaluasi."
-                            )
-                        image_bytes = encoded_frame.tobytes()
-                        frame_hash = self.memory_engine.perceptual_hash(image_bytes)
-                        score = 7
-                        if should_use_ollama and video_path in sample_video_set:
-                            score = OllamaAIAnalyst.score_video_clip_with_memory(
-                                self.ollama_model,
-                                None,
-                                self.memory_engine,
-                                prompt_override=self.prompt_override,
-                                image_bytes=image_bytes,
-                                examples=memory_examples,
-                                memory_profile=memory_profile,
-                            )
+                        frame_hash = sample["frame_hash"]
+                        score = sample_scores[sample_index - 1]
                         if should_rank:
                             score = self.memory_engine.adjust_score_by_memory(
                                 frame_hash, score, memory_evaluations
@@ -2063,7 +2438,7 @@ class VideoProcessingWorker(QThread):
                             {
                                 "file": video_path,
                                 "file_index": file_index,
-                                "start": start,
+                                "start": sample["start"],
                                 "source_duration": source_duration,
                                 "score": score,
                                 "perceptual_hash": frame_hash,
@@ -2071,19 +2446,18 @@ class VideoProcessingWorker(QThread):
                         )
                         completed_samples += 1
                         recent_sample_durations.append(
-                            time.perf_counter() - sample_started_at
+                            sample_elapsed_times[sample_index - 1]
+                            + time.perf_counter() - sample_started_at
                         )
                         del recent_sample_durations[:-20]
                         report_scan_progress(file_index, video_path, sample_index)
-                finally:
-                    capture.release()
 
-                self.log_signal.emit(
-                    f"   ├ [{file_index + 1}/{len(video_files)}] "
-                    f"{os.path.basename(video_path)}: "
-                    f"{len(starts)} posisi sampel"
-                )
-                report_scan_progress(file_index, video_path)
+                    self.log_signal.emit(
+                        f"   ├ [{file_index + 1}/{len(video_files)}] "
+                        f"{os.path.basename(video_path)}: "
+                        f"{len(starts)} posisi sampel"
+                    )
+                    report_scan_progress(file_index, video_path)
 
             scan_finished_at = datetime.now().astimezone()
             scan_elapsed = time.perf_counter() - scan_started_at
@@ -2284,12 +2658,15 @@ class VideoProcessingWorker(QThread):
                     "-t", str(target_duration),
                     "-map", "0:v:0",
                     "-vf", ",".join(vf_filters),
-                    "-c:v", "h264_nvenc",
-                    "-preset", "p4",
-                    "-cq", "19",
-                    "-b:v", "35M",
-                    "-maxrate", "50M",
-                    "-bufsize", "70M",
+                    "-c:v", "hevc_nvenc",
+                    "-preset", "p7",
+                    "-tune", "hq",
+                    "-rc", "vbr",
+                    "-cq", "18",
+                    "-b:v", "20M",
+                    "-spatial-aq", "1",
+                    "-temporal-aq", "1",
+                    "-rc-lookahead", "32",
                     "-c:a", "aac",
                     "-b:a", "320k",
                     "-shortest",
