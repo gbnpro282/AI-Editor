@@ -20,6 +20,383 @@ import numpy as np
 import cv2
 import librosa
 from datetime import datetime, timedelta
+import gc
+import os
+import re
+import json
+import time
+import ctypes
+import logging
+import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+logger = logging.getLogger("AI_Video_Studio_Pro.MaxGuard")
+
+
+@dataclass
+class RenderTelemetryResult:
+    """Menyimpan metrik performa aktual selama proses encoding FFmpeg berlangsung."""
+    success: bool
+    return_code: int
+    dropped_frames: int = 0
+    duplicated_frames: int = 0
+    total_encoded_frames: int = 0
+    average_speed: float = 0.0
+    elapsed_seconds: float = 0.0
+    abort_reason: Optional[str] = None
+
+
+@dataclass
+class FrameIntegrityAudit:
+    """Hasil audit presisi tingkat frame untuk mencegah video patah-patah lolos QC."""
+    passed: bool
+    measured_fps: float
+    total_frames: int
+    max_pts_jitter_ms: float
+    p99_pts_jitter_ms: float
+    freeze_segments: List[Dict[str, float]] = field(default_factory=list)
+    failure_reasons: List[str] = field(default_factory=list)
+
+
+class RenderMaxBooster:
+    """
+    Memaksa sistem operasi, alokasi VRAM GPU, dan parameter pipeline FFmpeg bekerja
+    pada kapasitas maksimal sebelum dan selama proses rendering berjalan.
+    """
+
+    @staticmethod
+    def maximize_system_and_gpu_resources() -> None:
+        """
+        1. Mengunci Windows agar tidak masuk mode hemat daya / throttling CPU-GPU.
+        2. Menaikkan prioritas proses ke HIGH_PRIORITY_CLASS.
+        3. Membersihkan sisa cache VRAM CUDA dari tahap inferensi AI sebelum NVENC aktif.
+        """
+        if os.name == "nt":
+            try:
+                # ES_CONTINUOUS (0x80000000) | ES_SYSTEM_REQUIRED (0x00000001) | ES_DISPLAY_REQUIRED (0x00000002)
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000003)
+                # HIGH_PRIORITY_CLASS (0x00000080)
+                process_handle = ctypes.windll.kernel32.GetCurrentProcess()
+                ctypes.windll.kernel32.SetPriorityClass(process_handle, 0x00000080)
+                logger.info("OS Power Lock & HIGH_PRIORITY_CLASS aktif untuk rendering maksimal.")
+            except Exception as exc:
+                logger.warning(f"Gagal mengatur prioritas proses Windows: {exc}")
+        else:
+            try:
+                os.nice(-10)
+            except Exception:
+                pass
+
+        # Bersihkan memori Python & sisa tensor CUDA agar VRAM tidak penuh dan meluber ke RAM
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                free_vram, total_vram = torch.cuda.mem_get_info()
+                logger.info(
+                    f"VRAM dibersihkan sebelum render: {free_vram / (1024**3):.2f} GB "
+                    f"tersedia dari {total_vram / (1024**3):.2f} GB."
+                )
+        except ImportError:
+            pass
+        except Exception as exc:
+            logger.warning(f"Pembersihan VRAM CUDA dilewati: {exc}")
+
+    @staticmethod
+    def enforce_maximal_ffmpeg_flags(
+        cmd: List[str],
+        target_fps: int = 60,
+        thread_queue_size: int = 4096,
+    ) -> List[str]:
+        """
+        Menyuntikkan parameter anti-stutter, buffer antrean input besar, dan sinkronisasi
+        Constant Frame Rate (CFR) ke dalam list perintah FFmpeg yang sudah ada.
+        """
+        if not cmd:
+            return cmd
+
+        enhanced_cmd: List[str] = [cmd[0]]
+        uses_filter_complex = "-filter_complex" in cmd
+        uses_nvenc = any("nvenc" in token.lower() for token in cmd)
+
+        i = 1
+        while i < len(cmd):
+            token = cmd[i]
+
+            # Pastikan setiap input (-i) memiliki thread_queue_size besar agar disk/pipe tidak starvation
+            if token == "-i" and (i == 1 or cmd[i - 2] != "-thread_queue_size"):
+                enhanced_cmd.extend(["-thread_queue_size", str(thread_queue_size), "-i"])
+                i += 1
+                continue
+
+            # Jika menggunakan -vf sederhana (bukan -filter_complex), paksa normalisasi FPS & PTS
+            if token == "-vf" and not uses_filter_complex and i + 1 < len(cmd):
+                existing_vf = cmd[i + 1]
+                sync_prefix = f"fps={target_fps},setpts=N/({target_fps}*TB)"
+                if "setpts=" not in existing_vf:
+                    existing_vf = f"{sync_prefix},{existing_vf}"
+                enhanced_cmd.extend(["-vf", existing_vf])
+                i += 2
+                continue
+
+            enhanced_cmd.append(token)
+            i += 1
+
+        output_path = enhanced_cmd.pop()
+
+        # Tambahkan tuning NVENC optimal (mencegah VRAM spillover ke RAM saat 4K 60fps)
+        extra_flags: List[str] = []
+        if uses_nvenc:
+            if "-rc-lookahead" not in enhanced_cmd:
+                extra_flags.extend(["-rc-lookahead", "32"])
+            if "-spatial-aq" not in enhanced_cmd:
+                extra_flags.extend(["-spatial-aq", "1", "-temporal-aq", "1", "-aq-strength", "8"])
+            if "-extra_hw_frames" not in enhanced_cmd:
+                # Sisipkan extra_hw_frames sebelum input pertama jika memungkinkan
+                first_input_idx = enhanced_cmd.index("-i") if "-i" in enhanced_cmd else -1
+                if first_input_idx > 0:
+                    enhanced_cmd[first_input_idx:first_input_idx] = ["-extra_hw_frames", "8"]
+
+        # Paksa output CFR ketat agar jarak antar-frame seragam 16.67ms (untuk 60fps)
+        if "-fps_mode" not in enhanced_cmd and "-vsync" not in enhanced_cmd:
+            extra_flags.extend(["-fps_mode", "cfr"])
+        if "-r" not in enhanced_cmd:
+            extra_flags.extend(["-r", str(target_fps)])
+
+        enhanced_cmd.extend(extra_flags)
+        enhanced_cmd.append(output_path)
+        return enhanced_cmd
+
+    @staticmethod
+    def execute_monitored_ffmpeg(
+        cmd: List[str],
+        max_allowed_drops: int = 0,
+    ) -> RenderTelemetryResult:
+        """
+        Menjalankan subprocess FFmpeg dengan prioritas tinggi dan memantau metrik
+        drop= / dup= / speed= secara real-time. Langsung membatalkan render jika terjadi drop.
+        """
+        start_time = time.perf_counter()
+        creation_flags = 0x00000080 if os.name == "nt" else 0  # HIGH_PRIORITY_CLASS
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=creation_flags,
+        )
+
+        last_frame = 0
+        last_drop = 0
+        last_dup = 0
+        last_speed = 0.0
+
+        re_frame = re.compile(r"frame=\s*(\d+)")
+        re_drop = re.compile(r"drop=\s*(\d+)")
+        re_dup = re.compile(r"dup=\s*(\d+)")
+        re_speed = re.compile(r"speed=\s*([\d.]+)x")
+
+        assert process.stderr is not None
+        for line in process.stderr:
+            m_frame = re_frame.search(line)
+            m_drop = re_drop.search(line)
+            m_dup = re_dup.search(line)
+            m_speed = re_speed.search(line)
+
+            if m_frame:
+                last_frame = int(m_frame.group(1))
+            if m_drop:
+                last_drop = int(m_drop.group(1))
+            if m_dup:
+                last_dup = int(m_dup.group(1))
+            if m_speed:
+                last_speed = float(m_speed.group(1))
+
+            if last_drop > max_allowed_drops:
+                process.kill()
+                elapsed = time.perf_counter() - start_time
+                reason = (
+                    f"Render dibatalkan otomatis: terdeteksi {last_drop} dropped frames "
+                    f"pada frame ke-{last_frame} (batas: {max_allowed_drops})."
+                )
+                logger.error(reason)
+                return RenderTelemetryResult(
+                    success=False,
+                    return_code=-9,
+                    dropped_frames=last_drop,
+                    duplicated_frames=last_dup,
+                    total_encoded_frames=last_frame,
+                    average_speed=last_speed,
+                    elapsed_seconds=round(elapsed, 2),
+                    abort_reason=reason,
+                )
+
+        return_code = process.wait()
+        elapsed = time.perf_counter() - start_time
+
+        return RenderTelemetryResult(
+            success=(return_code == 0),
+            return_code=return_code,
+            dropped_frames=last_drop,
+            duplicated_frames=last_dup,
+            total_encoded_frames=last_frame,
+            average_speed=last_speed,
+            elapsed_seconds=round(elapsed, 2),
+            abort_reason=None if return_code == 0 else f"FFmpeg exit code {return_code}",
+        )
+
+
+class FrameStutterGuard:
+    """
+    Gerbang QC ketat tingkat frame: menolak video jika terdapat PTS jitter, frame duplikat
+    berlebih, atau visual freeze meskipun metadata header terbaca 60 FPS.
+    """
+
+    @staticmethod
+    def audit_video_smoothness(
+        video_path: str,
+        target_fps: int = 60,
+        telemetry: Optional[RenderTelemetryResult] = None,
+        max_allowed_jitter_ms: float = 4.5,
+        max_duplicate_ratio: float = 0.02,
+        freeze_min_duration_sec: float = 0.05,
+    ) -> FrameIntegrityAudit:
+        """
+        Memeriksa kelancaran aktual tiap frame menggunakan ffprobe timestamp delta dan
+        filter FFmpeg freezedetect.
+        """
+        reasons: List[str] = []
+        path_obj = Path(video_path)
+
+        if not path_obj.exists() or path_obj.stat().st_size == 0:
+            return FrameIntegrityAudit(
+                passed=False,
+                measured_fps=0.0,
+                total_frames=0,
+                max_pts_jitter_ms=999.0,
+                p99_pts_jitter_ms=999.0,
+                failure_reasons=["File hasil render tidak ditemukan atau kosong (0 byte)."],
+            )
+
+        # 1. Validasi data telemetry langsung dari proses encoding (jika tersedia)
+        if telemetry is not None:
+            if not telemetry.success:
+                reasons.append(telemetry.abort_reason or "Proses encoding FFmpeg gagal.")
+            if telemetry.dropped_frames > 0:
+                reasons.append(f"Terdapat {telemetry.dropped_frames} dropped frames saat render.")
+            if telemetry.total_encoded_frames > 0:
+                dup_ratio = telemetry.duplicated_frames / telemetry.total_encoded_frames
+                if dup_ratio > max_duplicate_ratio:
+                    reasons.append(
+                        f"Frame duplikat berlebih: {dup_ratio:.2%} "
+                        f"({telemetry.duplicated_frames}/{telemetry.total_encoded_frames} frame)."
+                    )
+
+        # 2. Audit jarak waktu antar-frame aktual (PTS Jitter) via ffprobe
+        probe_cmd = [
+            "ffprobe",
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "frame=best_effort_timestamp_time",
+            "-of", "json",
+            str(path_obj),
+        ]
+        probe_res = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+        frames_data = json.loads(probe_res.stdout).get("frames", [])
+
+        timestamps = [
+            float(item["best_effort_timestamp_time"])
+            for item in frames_data
+            if "best_effort_timestamp_time" in item
+        ]
+        total_frames = len(timestamps)
+
+        if total_frames < 2:
+            return FrameIntegrityAudit(
+                passed=False,
+                measured_fps=0.0,
+                total_frames=total_frames,
+                max_pts_jitter_ms=999.0,
+                p99_pts_jitter_ms=999.0,
+                failure_reasons=["Jumlah frame video kurang dari 2 frame."],
+            )
+
+        ideal_step_ms = 1000.0 / target_fps
+        deltas_ms = [
+            (timestamps[idx] - timestamps[idx - 1]) * 1000.0
+            for idx in range(1, total_frames)
+        ]
+        jitters_ms = sorted(abs(d - ideal_step_ms) for d in deltas_ms)
+        max_jitter_ms = jitters_ms[-1]
+        p99_jitter_ms = jitters_ms[int(len(jitters_ms) * 0.99)]
+
+        duration_sec = timestamps[-1] - timestamps[0]
+        measured_fps = (total_frames - 1) / duration_sec if duration_sec > 0 else 0.0
+
+        if abs(measured_fps - target_fps) > 0.5:
+            reasons.append(
+                f"FPS aktual ({measured_fps:.2f} fps) tidak mencapai target {target_fps} fps."
+            )
+        if p99_jitter_ms > max_allowed_jitter_ms:
+            reasons.append(
+                f"Terdeteksi micro-stutter (P99 PTS jitter {p99_jitter_ms:.2f} ms > {max_allowed_jitter_ms} ms)."
+            )
+
+        # 3. Deteksi visual frame membeku / patah-patah (3+ frame identik beruntun pada 60fps)
+        freeze_cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-i", str(path_obj),
+            "-vf", f"freezedetect=n=-60dB:d={freeze_min_duration_sec}",
+            "-map", "0:v:0",
+            "-f", "null",
+            "-",
+        ]
+        freeze_res = subprocess.run(
+            freeze_cmd, capture_output=True, text=True, encoding="utf-8", errors="replace"
+        )
+
+        freeze_segments: List[Dict[str, float]] = []
+        freeze_start: Optional[float] = None
+        for line in freeze_res.stderr.splitlines():
+            if "freeze_start:" in line:
+                try:
+                    freeze_start = float(line.split("freeze_start:")[1].strip())
+                except ValueError:
+                    freeze_start = None
+            elif "freeze_duration:" in line and freeze_start is not None:
+                try:
+                    dur = float(line.split("freeze_duration:")[1].strip())
+                    freeze_segments.append({
+                        "start_sec": round(freeze_start, 3),
+                        "duration_sec": round(dur, 3),
+                    })
+                    freeze_start = None
+                except ValueError:
+                    pass
+
+        if freeze_segments:
+            reasons.append(
+                f"Terdeteksi {len(freeze_segments)} titik visual freeze/stutter: {freeze_segments[:3]}"
+            )
+
+        return FrameIntegrityAudit(
+            passed=(len(reasons) == 0),
+            measured_fps=round(measured_fps, 3),
+            total_frames=total_frames,
+            max_pts_jitter_ms=round(max_jitter_ms, 3),
+            p99_pts_jitter_ms=round(p99_jitter_ms, 3),
+            freeze_segments=freeze_segments,
+            failure_reasons=reasons,
+        )
 
 # ==============================================================================
 # AUTOMATIC ENVIRONMENT SETUP & PATH INJECTION
@@ -2823,6 +3200,7 @@ class VideoProcessingWorker(QThread):
                         "format=nv12",
                     ]
                 )
+                RenderMaxBooster.maximize_system_and_gpu_resources()
                 ffmpeg_cmd = [
                     "ffmpeg", "-y",
                     "-f", "concat",
@@ -3097,6 +3475,11 @@ class VideoProcessingWorker(QThread):
                 selected_cuts = replacement_cuts
                 automatic_retries = 0
                 attempt += 1
+
+            cmd = RenderMaxBooster.enforce_maximal_ffmpeg_flags(cmd, target_fps=60)
+            render_telemetry = RenderMaxBooster.execute_monitored_ffmpeg(cmd, max_allowed_drops=0)
+            if not render_telemetry.success:
+                raise RuntimeError(f"Render dihentikan karena performa drop: {render_telemetry.abort_reason}")
 
             os.replace(pending_render_path, final_output_path)
             pending_render_path = None
