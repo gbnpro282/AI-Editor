@@ -69,6 +69,184 @@ OLLAMA_API_URL = "http://localhost:11434/api/generate"
 DEFAULT_VISION_MODEL = "qwen2.5vl:3b"
 
 
+class VideoQualityChecker:
+    """Verify that a rendered video meets the required output specifications."""
+
+    @staticmethod
+    def _parse_frame_rate(value):
+        try:
+            if "/" in value:
+                numerator, denominator = value.split("/", 1)
+                denominator = int(denominator)
+                return int(numerator) / denominator if denominator else 0.0
+            return float(value)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return 0.0
+
+    @staticmethod
+    def inspect_output_video(
+        file_path, expected_min_fps=59.9, target_res=None
+    ):
+        command = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-count_frames",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-show_format",
+            file_path,
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                check=True,
+            )
+            data = json.loads(result.stdout)
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            json.JSONDecodeError,
+        ) as error:
+            return False, {
+                "file": file_path,
+                "passed": False,
+                "error": f"Gagal menjalankan FFprobe QC: {error}",
+                "reasons": [f"Metadata video tidak dapat diverifikasi: {error}"],
+            }
+
+        if not isinstance(data, dict) or not isinstance(data.get("streams"), list):
+            reason = "FFprobe mengembalikan metadata video dengan format tidak valid."
+            return False, {
+                "file": file_path,
+                "passed": False,
+                "error": reason,
+                "reasons": [reason],
+            }
+
+        video_stream = next(
+            (
+                stream
+                for stream in data.get("streams", [])
+                if isinstance(stream, dict)
+                and stream.get("codec_type") == "video"
+            ),
+            None,
+        )
+        if video_stream is None:
+            reason = "Stream video tidak ditemukan dalam file output."
+            return False, {
+                "file": file_path,
+                "passed": False,
+                "error": reason,
+                "reasons": [reason],
+            }
+
+        average_fps = VideoQualityChecker._parse_frame_rate(
+            video_stream.get("avg_frame_rate", "")
+        )
+        nominal_fps = VideoQualityChecker._parse_frame_rate(
+            video_stream.get("r_frame_rate", "")
+        )
+        actual_fps = average_fps or nominal_fps
+        try:
+            width = int(video_stream.get("width") or 0)
+        except (TypeError, ValueError):
+            width = 0
+        try:
+            height = int(video_stream.get("height") or 0)
+        except (TypeError, ValueError):
+            height = 0
+
+        format_data = data.get("format")
+        if not isinstance(format_data, dict):
+            format_data = {}
+        duration = 0.0
+        for duration_value in (
+            video_stream.get("duration"),
+            format_data.get("duration"),
+        ):
+            try:
+                duration = float(duration_value)
+            except (TypeError, ValueError):
+                continue
+            if duration > 0:
+                break
+
+        frame_count = 0
+        for frame_count_value in (
+            video_stream.get("nb_read_frames"),
+            video_stream.get("nb_frames"),
+        ):
+            try:
+                frame_count = int(frame_count_value)
+            except (TypeError, ValueError):
+                continue
+            if frame_count > 0:
+                break
+
+        bitrate = 0
+        for bitrate_value in (
+            video_stream.get("bit_rate"),
+            format_data.get("bit_rate"),
+        ):
+            try:
+                bitrate = int(bitrate_value)
+            except (TypeError, ValueError):
+                continue
+            if bitrate > 0:
+                break
+
+        expected_frames = round(duration * 60) if duration > 0 else 0
+        frame_tolerance = duration * 2
+        reasons = []
+        if actual_fps < expected_min_fps:
+            reasons.append(
+                f"FPS tidak memenuhi target: {actual_fps:.3f} FPS "
+                f"(minimal {expected_min_fps:.1f} FPS)."
+            )
+        if duration <= 0:
+            reasons.append("Durasi video tidak dapat diverifikasi.")
+        if frame_count <= 0:
+            reasons.append("Jumlah frame video tidak dapat diverifikasi.")
+        elif duration > 0 and abs(frame_count - expected_frames) > frame_tolerance:
+            reasons.append(
+                f"Jumlah frame tidak sesuai: {frame_count}, "
+                f"diharapkan sekitar {expected_frames}."
+            )
+
+        actual_resolution = (width, height)
+        if target_res and actual_resolution != tuple(target_res):
+            reasons.append(
+                f"Resolusi tidak sesuai: {width}x{height}, "
+                f"target {target_res[0]}x{target_res[1]}."
+            )
+        if bitrate < 15_000_000:
+            reasons.append(
+                f"Bitrate video di bawah target minimum 15 Mbps: "
+                f"{bitrate / 1_000_000:.2f} Mbps."
+            )
+
+        report = {
+            "file": file_path,
+            "passed": not reasons,
+            "actual_fps": round(actual_fps, 3),
+            "resolution": f"{width}x{height}",
+            "duration_sec": round(duration, 3),
+            "total_frames": frame_count,
+            "expected_frames": expected_frames,
+            "bitrate_bps": bitrate,
+            "reasons": reasons,
+        }
+        return not reasons, report
+
+
 def format_elapsed_time(seconds):
     total_seconds = max(0, int(seconds))
     hours, remainder = divmod(total_seconds, 3600)
@@ -1824,6 +2002,25 @@ class VideoProcessingWorker(QThread):
         return decision
 
     def run(self):
+        pending_render_path = None
+        pending_preview_path = None
+
+        def cleanup_pending_outputs():
+            nonlocal pending_render_path, pending_preview_path
+            for path in (pending_render_path, pending_preview_path):
+                if not path:
+                    continue
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+                except OSError as error:
+                    self.log_signal.emit(
+                        f"Tidak dapat menghapus file render sementara {path}: {error}"
+                    )
+            pending_render_path = None
+            pending_preview_path = None
+
         try:
             self.log_signal.emit("🚀 Memulai Autopilot AI Video Editing Pipeline...")
             self.progress_signal.emit(5)
@@ -2554,6 +2751,7 @@ class VideoProcessingWorker(QThread):
             automatic_retries = 0
 
             while True:
+                cleanup_pending_outputs()
                 scene_metadata = []
                 timeline_position = 0.0
                 for scene_index, cut in enumerate(selected_cuts):
@@ -2587,6 +2785,14 @@ class VideoProcessingWorker(QThread):
                 preview_output_path = (
                     os.path.splitext(final_output_path)[0] + "_preview.wmv"
                 )
+                pending_render_path = os.path.join(
+                    self.output_folder,
+                    f".{render_base}{attempt_suffix}.pending.mp4",
+                )
+                pending_preview_path = os.path.join(
+                    self.output_folder,
+                    f".{render_base}{attempt_suffix}_preview.pending.wmv",
+                )
                 concat_list_path = os.path.join(
                     self.output_folder, "ffmpeg_concat_list.txt"
                 )
@@ -2613,8 +2819,8 @@ class VideoProcessingWorker(QThread):
                         f"scale={self.target_width}:{self.target_height}:"
                         "force_original_aspect_ratio=increase",
                         f"crop={self.target_width}:{self.target_height}",
-                        "fps=60",
-                        "format=yuv420p",
+                        "fps=fps=60:round=near",
+                        "format=nv12",
                     ]
                 )
                 ffmpeg_cmd = [
@@ -2667,10 +2873,13 @@ class VideoProcessingWorker(QThread):
                     "-spatial-aq", "1",
                     "-temporal-aq", "1",
                     "-rc-lookahead", "32",
+                    "-fps_mode", "cfr",
+                    "-r", "60",
+                    "-g", "60",
                     "-c:a", "aac",
                     "-b:a", "320k",
                     "-shortest",
-                    final_output_path,
+                    pending_render_path,
                 ])
 
                 if attempt:
@@ -2694,6 +2903,7 @@ class VideoProcessingWorker(QThread):
                 if os.path.exists(concat_list_path):
                     os.remove(concat_list_path)
                 if process.returncode != 0:
+                    cleanup_pending_outputs()
                     self.error_signal.emit(
                         "Gagal merender video dengan FFmpeg! Periksa keterhubungan "
                         "file audio & driver GPU."
@@ -2701,11 +2911,30 @@ class VideoProcessingWorker(QThread):
                     return
 
                 self.log_signal.emit(
+                    "QC FFprobe: memeriksa FPS 60, jumlah frame, resolusi, dan bitrate."
+                )
+                output_qc_passed, output_qc_report = (
+                    VideoQualityChecker.inspect_output_video(
+                        pending_render_path,
+                        target_res=(self.target_width, self.target_height),
+                    )
+                )
+                if not output_qc_passed:
+                    cleanup_pending_outputs()
+                    failure_details = "; ".join(
+                        output_qc_report.get("reasons")
+                        or [output_qc_report.get("error", "Pemeriksaan FFprobe gagal.")]
+                    )
+                    self.log_signal.emit(f"QC GAGAL: {failure_details}")
+                    self.error_signal.emit(f"QC GAGAL: {failure_details}")
+                    return
+
+                self.log_signal.emit(
                     "QC hasil render: decode, frame hitam/beku, audio/video, "
                     "durasi, dan kelancaran timestamp."
                 )
                 render_report = check_render_quality(
-                    final_output_path,
+                    pending_render_path,
                     expected_duration=target_duration,
                     timeout=max(120, int(target_duration * 3)),
                     allow_silent_audio=not self.sound_path,
@@ -2715,7 +2944,7 @@ class VideoProcessingWorker(QThread):
                 if render_report["status"] == "ok":
                     preview_cmd = [
                         "ffmpeg", "-y",
-                        "-i", final_output_path,
+                        "-i", pending_render_path,
                         "-map", "0:v:0",
                         "-map", "0:a:0?",
                         "-vf", "scale=-2:720,fps=30,format=yuv420p",
@@ -2726,7 +2955,7 @@ class VideoProcessingWorker(QThread):
                         "-ar", "44100",
                         "-ac", "2",
                         "-shortest",
-                        preview_output_path,
+                        pending_preview_path,
                     ]
                     self.log_signal.emit(
                         "Menyiapkan dan memeriksa preview kompatibel Windows..."
@@ -2753,7 +2982,7 @@ class VideoProcessingWorker(QThread):
                         quality_report["status"] = "error"
                     else:
                         preview_report = check_render_quality(
-                            preview_output_path,
+                            pending_preview_path,
                             expected_duration=target_duration,
                             timeout=max(120, int(target_duration * 3)),
                             allow_silent_audio=not self.sound_path,
@@ -2796,8 +3025,10 @@ class VideoProcessingWorker(QThread):
                     quality_report["status"] = "error"
 
                 if quality_report["status"] == "ok":
+                    quality_report["render_path"] = final_output_path
                     break
 
+                cleanup_pending_outputs()
                 self.log_signal.emit(
                     f"QC menemukan {len(quality_report['findings'])} masalah:"
                 )
@@ -2808,6 +3039,7 @@ class VideoProcessingWorker(QThread):
                     finding["code"] == "quality_report_not_saved"
                     for finding in quality_report["findings"]
                 ):
+                    cleanup_pending_outputs()
                     self.error_signal.emit(
                         "Laporan QC tidak dapat disimpan. Preview dan download "
                         "ditahan agar hasil yang belum terverifikasi tidak digunakan."
@@ -2834,6 +3066,7 @@ class VideoProcessingWorker(QThread):
                 )
                 decision = self.wait_for_qc_decision(quality_report)
                 if decision == "cancel":
+                    cleanup_pending_outputs()
                     self.log_signal.emit("Proses dibatalkan setelah QC tidak lulus.")
                     self.cancelled_signal.emit()
                     return
@@ -2855,6 +3088,7 @@ class VideoProcessingWorker(QThread):
                             "seluruh video akan dirender ulang dengan adegan saat ini."
                         )
                     else:
+                        cleanup_pending_outputs()
                         self.error_signal.emit(
                             "Tidak ada adegan alternatif yang tersedia untuk "
                             "diperbaiki. Tambahkan video sumber lain lalu jalankan ulang."
@@ -2864,6 +3098,10 @@ class VideoProcessingWorker(QThread):
                 automatic_retries = 0
                 attempt += 1
 
+            os.replace(pending_render_path, final_output_path)
+            pending_render_path = None
+            os.replace(pending_preview_path, preview_output_path)
+            pending_preview_path = None
             self.progress_signal.emit(100)
             self.log_signal.emit(
                 f"QC render dan preview lulus. Hasil siap ditinjau: {final_output_path}"
@@ -2875,6 +3113,7 @@ class VideoProcessingWorker(QThread):
                 quality_report,
             )
         except Exception as e:
+            cleanup_pending_outputs()
             self.error_signal.emit(f"Error tidak terduga pada pipeline: {str(e)}")
 
 # ==============================================================================
